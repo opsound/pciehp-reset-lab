@@ -1,0 +1,65 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Guest init: mount pseudo filesystems, read scn=/var=/n=/a= from the kernel
+# command line, run /scn/$scn.sh with the helpers of /scn/lib.sh, check the
+# hot-added devices (lib.sh added_check), power off.
+#
+# Two serial ports: ttyS0 is the console (kernel messages and the scenario's
+# output, which can interleave mid-line), ttyS1 (fd 9, host file guest.log)
+# carries only what the host parses: @@ACT requests (lib.sh act()) as they
+# happen, and at the end a SUMMARY section (the scenario's RESULT and check
+# lines, captured cleanly through a pipe) and a DMESG section (the whole
+# kernel log, also when the console loglevel was lowered).
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+ln -sf /proc/self/fd /dev/fd
+mount -t debugfs debugfs /sys/kernel/debug
+mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null
+echo 1 > /proc/sys/kernel/sysrq
+for kv in $(cat /proc/cmdline); do
+	case $kv in scn=*|var=*|n=*|a=*) eval "${kv%%=*}='${kv#*=}'";; esac
+done
+ACTCH=console
+if [ -c /dev/ttyS1 ] && (: > /dev/ttyS1) 2>/dev/null; then
+	exec 9>/dev/ttyS1
+	stty -F /dev/ttyS1 raw -echo 2>/dev/null
+	ACTCH=tty
+fi
+. /scn/lib.sh
+echo "GUEST-READY scn=$scn var=$var n=$n act=$ACTCH kernel=$(uname -r)"
+[ $ACTCH = tty ] && echo "GUEST-READY scn=$scn var=$var n=$n act=$ACTCH kernel=$(uname -r)" >&9
+# The scenario's output goes through tee to the console and /tmp/scn.out.  tee
+# is orphaned through a FIFO, so a bare `wait` in a scenario doesn't wait for it.
+mkfifo /tmp/scn.fifo
+(tee /tmp/scn.out < /tmp/scn.fifo &)
+exec 3>/tmp/scn.fifo
+if [ -f /scn/$scn.sh ]; then
+	. /scn/$scn.sh >&3 2>&1
+	[ -n "$NO_ADDED_CHECK" ] || added_check >&3 2>&1
+else
+	result "FAIL unknown scenario $scn" >&3
+fi
+# tee copies in order, so once the end marker is in /tmp/scn.out, so is
+# everything before it.
+echo "SCN-END" >&3
+exec 3>&-
+i=0
+while ! grep -q '^SCN-END' /tmp/scn.out && [ $i -lt 200 ]; do sleep 0.05; i=$((i + 1)); done
+if [ $ACTCH = tty ]; then
+	{
+		echo "SUMMARY-BEGIN"
+		grep -aE "^(RESULT: |LOCKDEP-LINES: |KASAN-LINES: |ADDED-CHECK|CHECK: )" /tmp/scn.out
+		echo "SUMMARY-END"
+		echo "DMESG-BEGIN"
+		dmesg
+		echo "DMESG-END"
+		echo "GUEST-DONE"
+	} >&9
+fi
+echo "GUEST-DONE"
+sync
+sleep 0.5
+echo o > /proc/sysrq-trigger
+sleep 30

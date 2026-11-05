@@ -1,0 +1,9 @@
+[submodule "linux"]
+	path = linux
+	url = https://github.com/opsound/linux.git
+	branch = pciehp-reset-fixes
+	shallow = true
+[submodule "qemu"]
+	path = qemu
+	url = https://github.com/qemu/qemu.git
+	shallow = true
