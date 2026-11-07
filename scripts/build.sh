@@ -24,7 +24,7 @@ BUG_KERNELS="mainline mainline-kasan mainline-hooks mainline-hooks-kasan mainlin
 # Every fix tree is built as <tree>-hooks, <tree>-hooks-kasan, <tree>-hooks-hc.
 FLAVORS="hooks hooks-kasan hooks-hc"
 # Static guest helpers, tools/<name>.c
-GUEST_TOOLS="vtool wloop"
+GUEST_TOOLS="vtool wloop cf1 aerinj"
 
 # Serial git phase: submodules, pins and the generated mainline-hooks tree.
 # Runs before any compile so parallel steps never contend on git metadata.

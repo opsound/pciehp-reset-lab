@@ -86,6 +86,18 @@ trace_on() {
 	echo 1 > $T/tracing_on
 }
 trace_dump() { echo 0 > $T/tracing_on; grep -v '^#' $T/trace; }
+# graph_on FUNC...: function_graph tracer on those of the functions that exist;
+# stays off if none does (an empty filter would trace everything).
+graph_on() {
+	local f
+	echo 0 > $T/tracing_on
+	echo > $T/trace
+	echo > $T/set_ftrace_filter
+	for f in $*; do echo $f >> $T/set_ftrace_filter 2>/dev/null; done
+	grep -q . $T/set_ftrace_filter || { log "graph_on: none of $* exists"; return 1; }
+	echo function_graph > $T/current_tracer
+	echo 1 > $T/tracing_on
+}
 # alive PID
 alive() { [ -d /proc/$1 ] && [ "$(awk '{print $3}' /proc/$1/stat)" != Z ]; }
 # wait_exit PID TIMEOUT_S
@@ -103,6 +115,24 @@ drv_of() { [ -e /sys/bus/pci/devices/$1/driver ] && basename "$(readlink /sys/bu
 # bar_ok BDF: BAR0 register matches the kernel's resource 0 and memory decode is on
 # pcicfg BDF OFFSET BYTES: a config register in hex without 0x, like setpci
 pcicfg() { od -An -tx$3 -j$(($2)) -N$3 /sys/bus/pci/devices/$1/config 2>/dev/null | tr -d ' \n'; }
+# pciwr BDF OFFSET BYTES VALUE: write a config register (VALUE in hex) in one
+# access through the sysfs config file
+pciwr() {
+	local v=$((0x$4)) i=0 b=
+	while [ $i -lt $3 ]; do b="$b\\x$(printf %02x $(( (v >> (8 * i)) & 0xff )))"; i=$((i + 1)); done
+	printf "$b" | dd of=/sys/bus/pci/devices/$1/config bs=$3 seek=$(( $2 / $3 )) count=1 conv=notrunc 2>/dev/null
+}
+# expcap BDF: config offset of the PCI Express capability (0 if none)
+expcap() {
+	local p id
+	p=$((0x$(pcicfg $1 0x34 1)))
+	while [ $p -ne 0 ]; do
+		id=$((0x$(pcicfg $1 $p 1)))
+		[ $id -eq 16 ] && { echo $p; return; }
+		p=$((0x$(pcicfg $1 $((p + 1)) 1)))
+	done
+	echo 0
+}
 # cfg BDF COMMAND|BASE_ADDRESS_0: config read bounded to 3 s ("blocked" if it
 # does not return: config accesses sleep while a reset holds the device).
 cfg() {

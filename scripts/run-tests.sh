@@ -42,7 +42,7 @@ TESTS=(
 	"hotadd-lockdep N1 plain plain - - lockdep 1 1"
 	"nested-lockdep N1 plain nestlock - - lockdep 1 1"
 	"host-reset-deadlock N2 hooks hostreset - - hang 1 1"
-	# N3: spurious-link-lookup-deadlock (in progress)
+	"spurious-link-lookup-deadlock N3 hooks spurlink reset - hang 2 2"
 	"reset-removal-uaf N4 hooks-kasan teardown err 20 kasan 12 2"
 	"reset-adding-device N5 hooks addwin win - hang 1 1"
 	"pciehp-unbind-uaf N6 kasan svcunbind fn 20 kasan 1 1"
@@ -63,7 +63,7 @@ TESTS=(
 	"recovery-hotadd-msix N12 hooks aermsix - - warn 2 3"
 	"sriov-remove-abba N13 hooks sriovabba sysfs - hang 1 2"
 	"sriov-pciehp-abba N13 hooks sriovabba pciehp - hang 2 6"
-	# N14: dead-link-reset-wait (in progress)
+	"dead-link-reset-wait N14 plain deadreset sysfs - fail 1 1"
 	"reset-holds-removing N15 hooks resetremove - - hang 2 3"
 	"reset-holds-probing N16 hooks resetprobe rescan 10 hang 2 3"
 	"reset-subordinate-uaf N17 kasan subuaf 4 20 kasan 2 3"
@@ -71,10 +71,10 @@ TESTS=(
 	"rescan-remove-deadlock N19 plain rescanrm race-dev 10 hang 2 3"
 	"sriov-host-reset-deadlock N20 hooks sriovreset hostreset - hang 1 2"
 	"sriov-linkdown-deadlock N20 hooks-hc sriovreset linkdown 60 hang 2 3"
-	# N21: pf-unbind-unlocked-vf-removal (in progress)
+	"pf-unbind-unlocked-vf-removal N21 plain pfunbind unbind - warn 1 2"
 	"removal-stall N22 plain vfstall pciehp - fail 1 2"
 	"bind-during-removal N23 plain bindremove sysfs - fail 1 2"
-	# N24: shutdown-aer-deadlock (in progress)
+	"shutdown-aer-deadlock N24 plain shutaer slot 10 hang 1 2"
 )
 # Fix tracking only: regressions that fix attempts introduced, not bugs of
 # v7.4-rc1.  "name - flavor scenario var rounds - - fixruns"

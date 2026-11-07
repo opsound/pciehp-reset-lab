@@ -31,7 +31,9 @@ import qxparse  # noqa: E402
 # topology, nestdevs: devices below the switch, rpsopts: extra properties of
 # the switch's root port, rpopts: extra properties of rp1..rpN, qemu_extra:
 # more -device arguments, append: extra kernel args, lockdep_check: a lockdep
-# report fails the run, by_var: per-variant overrides.
+# report fails the run, shutdown_check: seconds to wait for the poweroff after
+# the guest is done (its result depends on it: qxparse "CHECK: poweroff"),
+# by_var: per-variant overrides.
 PCP_OFF = "power_controller_present=off"
 # A Root Port without a hotplug slot, with an igb PF present at boot.
 RPC_IGB = ["-device", "pcie-root-port,id=rpc,bus=pcie.0,chassis=50,slot=50,addr=0x1d,hotplug=off",
@@ -74,12 +76,25 @@ SCN = {
     "rpmsafe": dict(var="rpm", rpopts=PCP_OFF, append="pcie_port_pm=force", timeout=120),
     "linkdownadd": dict(timeout=120),
     "pfprobe": dict(append="igb.max_vfs=2", timeout=150),
+    # B = e1000e on rp1, removed through sysfs: the pci_bus_sem writer
+    "spurlink": dict(nested=True, nestdevs="e1000e+e1000e,e1000e", var="reset", timeout=200,
+                     qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"]),
+    # vfio waits for two resets of the dead device
+    "deadreset": dict(var="sysfs", timeout=300, by_var={"vfio": dict(timeout=420)},
+                      qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"]),
+    # The igb PF is present at boot, so that no hot-add (and N1's lockdep
+    # report, which turns lockdep off) precedes the test; race re-adds it.
+    "pfunbind": dict(var="unbind", timeout=150, qemu_extra=["-device", "igb,id=pf1,bus=rp1"],
+                     by_var={"race": dict(a="12", timeout=400)}),
+    "shutaer": dict(var="slot", a="10", timeout=150, shutdown_check=45,
+                    qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"],
+                    by_var={"bus": dict(rpopts="hotplug=off")}),
 }
 
 
 def defaults(scn, var):
     d = dict(n=2, var="x", a="", timeout=200, nested=False, nestdevs="e1000e,e1000e", rpsopts="", rpopts="",
-             qemu_extra=[], append="", loglevel=7, lockdep_check=False)
+             qemu_extra=[], append="", loglevel=7, lockdep_check=False, shutdown_check=0)
     d.update({k: v for k, v in SCN.get(scn, {}).items() if k != "by_var"})
     v = var if var is not None else d["var"]
     d.update(SCN.get(scn, {}).get("by_var", {}).get(v, {}))
@@ -241,7 +256,7 @@ def main():
             break
         time.sleep(0.2)
     # Let the guest power off (it may not: device_shutdown() blocks behind a deadlock).
-    for _ in range(30):
+    for _ in range(int((d["shutdown_check"] or 6) * 5)):
         if q.poll() is not None:
             break
         time.sleep(0.2)

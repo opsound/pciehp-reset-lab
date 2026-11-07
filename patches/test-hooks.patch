@@ -14,6 +14,8 @@ trigger otherwise.  Every hook and knob is inert until written to:
   (pci_bus_error_reset(), pcie_do_recovery()); aer_link_delay_ms widens the
   window between the error_detected walk and the reset.
 - slot_reset calls the hotplug slot's ->reset_slot() directly.
+- link_change queues the Data Link Layer State Changed event that a real
+  port reports after a Secondary Bus Reset; QEMU's ports never report it.
 - hold_rescan_ms holds pci_rescan_remove_lock; remove_locked removes a
   device with the lock held across the whole removal.
 - rpm_allow lets a port without a PM capability runtime suspend.
@@ -31,9 +33,9 @@ kernels whose names contain "hooks".
  drivers/pci/hotplug/pciehp_pci.c        |   4 +
  drivers/pci/hotplug/pciehp_test_knobs.c |  66 ++++
  drivers/pci/pci-driver.c                |   3 +
- drivers/pci/pcitest_hooks.c             | 474 ++++++++++++++++++++++++
+ drivers/pci/pcitest_hooks.c             | 505 ++++++++++++++++++++++++
  drivers/pci/probe.c                     |   3 +
- 7 files changed, 558 insertions(+)
+ 7 files changed, 589 insertions(+)
 
 diff --git a/drivers/pci/Makefile b/drivers/pci/Makefile
 index 41ebc3b9a518..bf2ed972912e 100644
@@ -183,10 +185,10 @@ index 7efe808cdf0c..6e1e688f166d 100644
  	error = pcibios_alloc_irq(pci_dev);
 diff --git a/drivers/pci/pcitest_hooks.c b/drivers/pci/pcitest_hooks.c
 new file mode 100644
-index 000000000000..bf05e2a92b8b
+index 000000000000..a5a2c27551b2
 --- /dev/null
 +++ b/drivers/pci/pcitest_hooks.c
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,505 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Test-only hooks for the pciehp/vfio/PCI-reset deadlock reproducers of
@@ -212,6 +214,13 @@ index 000000000000..bf05e2a92b8b
 + * /sys/kernel/debug/pcitest2/slot_reset: "BDF" like pcitest/slot_reset but
 + *	without pci_cfg_access_lock(), so that reset_lock is the only lock the
 + *	reset can block on.  Returns -ENOTTY if there is no hotplug slot.
++ * /sys/kernel/debug/pcitest/link_change: "BDF" queues a Data Link Layer State
++ *	Changed event for pciehp of the port's slot, as if its IRQ handler had
++ *	read DLLSC from Slot Status.  Real ports report DLLSC when a Secondary
++ *	Bus Reset takes the link down and up; QEMU's ports never set it.  After
++ *	a slot reset, which leaves PCI_LINK_CHANGED set, pciehp treats the event
++ *	as spurious (pciehp_ignore_link_change()).  Logs "pcitest: link_change
++ *	BDF"; -ENODEV if pciehp doesn't drive the slot.
 + * /sys/kernel/debug/pcitest/aer_reset, aer_host_reset: "BDF [MS]" like err_reset/host_reset,
 + *   but through pcie_do_recovery(), so drivers restore their devices
 + * /sys/kernel/debug/pcitest/err_reset: "BDF [MS]" sleeps MS
@@ -255,6 +264,7 @@ index 000000000000..bf05e2a92b8b
 +#include <linux/pm_runtime.h>
 +#include <linux/uaccess.h>
 +#include "pci.h"
++#include "hotplug/pciehp.h"
 +#if IS_BUILTIN(CONFIG_PCI_HOST_COMMON)
 +#include "controller/pci-host-common.h"
 +#endif
@@ -400,6 +410,27 @@ index 000000000000..bf05e2a92b8b
 +	pr_info("pcitest2: slot_reset %s: done ret=%d\n", pci_name(dev), ret);
 +	pci_dev_put(dev);
 +	return ret ? ret : len;
++}
++
++static ssize_t link_change_write(struct file *f, const char __user *ubuf,
++				 size_t len, loff_t *ppos)
++{
++	struct hotplug_slot *hp;
++	struct pci_dev *dev;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, NULL, &ret);
++	if (!dev)
++		return ret;
++	ret = -ENODEV;
++	hp = pcitest_hotplug_slot(dev);
++	if (hp && hp->ops->reset_slot == pciehp_reset_slot) {
++		pr_info("pcitest: link_change %s\n", pci_name(dev));
++		pciehp_request(to_ctrl(hp), PCI_EXP_SLTSTA_DLLSC);
++		ret = len;
++	}
++	pci_dev_put(dev);
++	return ret;
 +}
 +
 +static ssize_t disconnect_write(struct file *f, const char __user *ubuf,
@@ -634,6 +665,7 @@ index 000000000000..bf05e2a92b8b
 +static const struct file_operations slot_reset_fops = { .write = slot_reset_write };
 +static const struct file_operations slot_reset2_fops = { .write = slot_reset2_write };
 +static const struct file_operations disconnect_fops = { .write = disconnect_write };
++static const struct file_operations link_change_fops = { .write = link_change_write };
 +
 +static int __init pcitest_hooks_init(void)
 +{
@@ -645,6 +677,7 @@ index 000000000000..bf05e2a92b8b
 +	debugfs_create_file("host_reset_nolock", 0200, d, NULL, &host_reset_nolock_fops);
 +	debugfs_create_file("slot_reset", 0200, d, NULL, &slot_reset_fops);
 +	debugfs_create_file("disconnect", 0200, d, NULL, &disconnect_fops);
++	debugfs_create_file("link_change", 0200, d, NULL, &link_change_fops);
 +	debugfs_create_file("slot_reset", 0200, d2, NULL, &slot_reset2_fops);
 +	debugfs_create_file("err_reset", 0200, d, NULL, &err_reset_fops);
 +	debugfs_create_file("aer_reset", 0200, d, NULL, &aer_reset_fops);

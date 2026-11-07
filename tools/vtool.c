@@ -5,7 +5,9 @@
 //	arm a request eventfd on each, then wait.  --respond closes a device when vfio
 //	relays a removal request for it.  --reset-on-req first issues VFIO_DEVICE_RESET
 //	on every other open device, like a live user resetting dev B while dev A is
-//	being removed.  SIGUSR1 closes all devices, last first.
+//	being removed.  SIGUSR1 closes all devices, last first; SIGUSR2 closes
+//	the first device only.  Devices in one IOMMU group (functions of one
+//	multifunction device) share the group fd.
 //   vtool loop N BDF	   open and close the device fd N times (close resets)
 //   vtool resetloop N BDF  open once, VFIO_DEVICE_RESET N times
 //   vtool hotresetloop N BDF  open once, VFIO_DEVICE_PCI_HOT_RESET N times
@@ -37,6 +39,8 @@ static const char *bdf[MAXDEV];
 static volatile sig_atomic_t do_close;
 
 static void on_usr1(int sig) { (void)sig; do_close = 1; }
+static volatile sig_atomic_t do_close1;
+static void on_usr2(int sig) { (void)sig; do_close1 = 1; }
 
 static double now(void)
 {
@@ -67,7 +71,14 @@ static void setup_groups(void)
 	if (container < 0) { perror("/dev/vfio/vfio"); exit(1); }
 	for (i = 0; i < ndev; i++) {
 		struct vfio_group_status st = { .argsz = sizeof(st) };
+		int j;
 
+		for (j = 0; j < i && group_of(bdf[j]) != group_of(bdf[i]); j++)
+			;
+		if (j < i) {	/* same group as an earlier device: one open per group */
+			grp[i] = grp[j];
+			continue;
+		}
 		snprintf(p, sizeof(p), "/dev/vfio/%d", group_of(bdf[i]));
 		grp[i] = open(p, O_RDWR);
 		if (grp[i] < 0) { perror(p); exit(1); }
@@ -273,6 +284,7 @@ static int cmd_hold(int respond, int reset_on_req)
 			fprintf(stderr, "%s: REQ irq: %s (continuing)\n", bdf[i], strerror(errno));
 	}
 	signal(SIGUSR1, on_usr1);
+	signal(SIGUSR2, on_usr2);
 	printf("READY pid=%d\n", getpid());
 	fflush(stdout);
 	while ((respond || reset_on_req) && !do_close) {
@@ -316,8 +328,15 @@ static int cmd_hold(int respond, int reset_on_req)
 			fflush(stdout);
 		}
 	}
-	while (!do_close)
+	while (!do_close) {
 		pause();
+		if (do_close1 && devfd[0] >= 0) {
+			close(devfd[0]);
+			devfd[0] = -1;
+			printf("closed %s\n", bdf[0]);
+			fflush(stdout);
+		}
+	}
 	for (i = ndev - 1; i >= 0; i--) {
 		if (devfd[i] < 0)
 			continue;

@@ -192,7 +192,18 @@ def parse(serial, guest=""):
         elif l.startswith("ADDED-CHECK ") and not l.rstrip().endswith(" ok"):
             added_bad.append(l[len("ADDED-CHECK "):].strip())
     kasan = [msg for t, msg in kl if "BUG: KASAN" in msg]
+    # A scenario that prints "CHECK: poweroff" is judged by the poweroff after
+    # GUEST-DONE: "reboot: Power down" must follow on the console, else the
+    # result becomes FAIL poweroff=hang (or =panic: init exits 30 s after
+    # GUEST-DONE, see guest/init).
+    poweroff = None
+    if res and re.search(r"^CHECK: poweroff", user, re.M) and not res.startswith("SKIP"):
+        tail = serial[serial.rfind("GUEST-DONE"):] if "GUEST-DONE" in serial else ""
+        poweroff = ("ok" if "reboot: Power down" in tail else
+                    "panic" if "Attempted to kill init" in tail else "hang")
+        res = res + " poweroff=ok" if poweroff == "ok" else "FAIL poweroff=%s %s" % (poweroff, res)
     return {
+        "poweroff": poweroff,
         "added": added,
         "added_bad": added_bad[:10],
         "kasan": kasan[:5],
