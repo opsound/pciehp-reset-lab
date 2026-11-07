@@ -473,9 +473,9 @@ remove_store(), a false positive; "remove" is DEVICE_ATTR_IGNORE_LOCKDEP in v7.4
 
 ## 3. Issues (N1-N24)
 
-N1-N10 and N15-N24 were found while testing; N11-N14 are pre-existing issues found by review or
-known from earlier reports. Earlier versions of this catalog called N11-N14 R1-R5 (R1 = N11, R2 = N12,
-R3 and R5 = N13, R4 = N14).
+N1-N10 and N15-N24 were found while testing; N11-N14 were found by review or are known from earlier
+reports. All of them are present in v7.4-rc1. Earlier versions of this catalog called N11-N14 R1-R5
+(R1 = N11, R2 = N12, R3 and R5 = N13, R4 = N14).
 
 ### N1. pciehp_configure_device() re-acquires reset_lock with pci_rescan_remove_lock held
 - Mechanism: hot-add takes reset_lock (read, pciehp_hpc.c:785), then pci_rescan_remove_lock
@@ -770,7 +770,7 @@ R3 and R5 = N13, R4 = N14).
   below the port with pci_dev_wait() (pci.c:1228-1316) for up to PCIE_RESET_READY_POLL_MS (60 s; its
   sleeps add up to 65.5 s) whenever the link reports active. The poll ends early only if the device
   answers or is marked disconnected (pci.c:1266); it does not look at link or presence again. Since
-  e8df1d194c39 (v7.4-rc1), a ~0 Vendor ID under RRS Software Visibility no longer ends it either. On
+  e8df1d194c39 (v7.3), a ~0 Vendor ID under RRS Software Visibility no longer ends it either. On
   ports faster than 5 GT/s without Data Link Layer Link Active Reporting, pcie_wait_for_link_delay()
   just sleeps and the 60 s poll follows; ports at 5 GT/s or less without it give up after 1 s.
   Throughout, the resetter holds the slot's reset_lock for writing (pciehp_reset_slot(),
