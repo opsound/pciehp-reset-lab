@@ -16,19 +16,9 @@ The lab has two suites:
 - **The bug suite** runs every test on v7.4-rc1 and expects the symptom of
   its bug. This is what `./run` does.
 - **Fix tracking** runs the same tests, plus regression tests for fix
-  attempts, on fix trees and expects every run to be clean. It currently
-  tracks a reference fix series, branch
-  [`pciehp-reset-fixes`](https://github.com/opsound/linux/tree/pciehp-reset-fixes)
-  of https://github.com/opsound/linux; its status is in
-  [docs/fix-status.md](docs/fix-status.md). Other trees can be added.
-
-**About the fix series.** It was written and validated with LLM assistance.
-Its author doesn't have enough expertise in pciehp, the PCI core reset code and
-vfio-pci to take it upstream alone, so it is meant as a reference for
-discussion and for whoever fixes these issues, not as a submission. Each
-commit message describes its bug, how the commit fixes it, and how it was
-tested. It fixes P0, N1, N2, N4-N9 and the original N10 deadlock, not N3, the
-N10 variants or N11-N24.
+  attempts, on fix trees and expects every run to be clean. It has its own
+  section, [Fix tracking](#fix-tracking), and status file,
+  [docs/fix-status.md](docs/fix-status.md).
 
 ## One-command run
 
@@ -59,14 +49,7 @@ Narrower commands:
 ./run test --runs 5 nested-removal  # override the number of runs
 ./run test --all-runs all           # every run, also after the symptom showed
 ./run test --jobs 8 all             # guests in parallel (default 1; ./run uses 4)
-./run fixes                         # fix tracking on configs/fix-trees.conf
-./run fixes --dry-run all           # list the fix tracking matrix
-./run fixes --tree ~/linux@my-fix --name my-fix   # fix tracking on a local tree
 ```
-
-`./run fixes --tree PATH[@REV]` tests a commit of a local Linux tree without
-modifying it. The build applies the first `patches/test-hooks*.patch` that
-applies (or `--patch FILE`).
 
 ## Kernels
 
@@ -75,9 +58,8 @@ applies (or `--patch FILE`).
 | `mainline` | v7.4-rc1 (6628e7d4c6b2) |
 | `mainline-hooks` | v7.4-rc1 + `patches/test-hooks.patch` (TEST ONLY) |
 | `mainline-hooks-hc` | the same, with `configs/hc.config` (`CONFIG_OF`, `CONFIG_PCI_HOST_GENERIC`) |
-| `<tree>-hooks`, `<tree>-hooks-hc` | a fix tree of `configs/fix-trees.conf` + its TEST ONLY patch |
 
-`mainline`, `mainline-hooks` and `<tree>-hooks` also build as `-kasan` with
+`mainline` and `mainline-hooks` also build as `-kasan` with
 `configs/kasan.config` (generic inline KASAN, `SLUB_DEBUG_ON`). All use
 `configs/linux-x86_64.config`, which has lockdep (`PROVE_LOCKING`),
 `DEBUG_ATOMIC_SLEEP`, `DEBUG_LIST`, `PCIEAER_INJECT` and a 20 s hung task
@@ -88,10 +70,8 @@ ONLY patch, which adds debugfs hooks under `/sys/kernel/debug/pcitest/` that
 emulate callers and events QEMU can't produce, such as AER/DPC recovery
 resets, `pci_host_reset_root_port()` and the link change a real port reports
 after a Secondary Bus Reset, and delays that widen windows in pciehp,
-`pci_device_add()` and probe. The hooks are inert until written to. The fix
-trees run every test with the patch, so a fix tree needs a variant of it that
-applies (`patches/test-hooks-pciehp-reset-fixes.patch` for the reference
-series). `link_down` exists only in the `-hc` kernels: it runs the real
+`pci_device_add()` and probe. The hooks are inert until written to.
+`link_down` exists only in the `-hc` kernels: it runs the real
 pci-host-common link-down recovery, which q35 can't reach otherwise.
 
 ## Tests
@@ -142,15 +122,6 @@ test). "v7.4-rc1" is the symptom the test expects there.
 | `bind-during-removal` | 1 | N23 | fail | e1000e is bound to a NIC below a switch whose sysfs removal waits for a vfio-pci holder; the bind must fail |
 | `shutdown-aer-deadlock` | 1 | N24 | hang | fatal AER errors injected every 10 ms through `/dev/aer_inject` into a poweroff |
 
-Fix tracking runs every test above, expecting it to be clean, plus these
-regression tests, which check fix attempts rather than v7.4-rc1 bugs:
-
-| test | tier | guards against | what it does |
-|---|---|---|---|
-| `pciehp-rpm-safe-removal` | 2 | a fix for N18 that re-enumerates a safely removed card on runtime resume | safe removal (sysfs power=0) of a card in a slot without a power controller while its Root Port is runtime-suspended; the slot must stay off |
-| `linkdown-hotadd-bars` | 2, hc | a fix for N2 or N20 that lets pciehp bind a device between the recovery's error_detected walk and its reset (N12) | a NIC hot-added while the real link-down recovery of its Root Port runs; it must end up bound with its BARs |
-| `pf-probe-sriov-removal` | 2 | a fix that takes pci_rescan_remove_lock while adding VFs and so deadlocks at probe time | a PF driver that enables SR-IOV in `->probe()` (igb max_vfs) is bound while a remover that holds pci_rescan_remove_lock waits for the PF |
-
 Expectations: `hang` (no completion, hung tasks, or a stuck operation),
 `lockdep` (a lockdep report), `kasan` (a KASAN report), `oops` (another BUG or
 oops), `warn` (a WARNING other than lockdep's), `fail` (the scenario's own
@@ -158,8 +129,7 @@ check failed, e.g. a hot-added device without its driver or with BAR0
 cleared, or an operation that took too long), `clean` (none of these). A run
 whose guest never booted counts as a harness error, never as a symptom. In
 the bug suite an entry passes once a run shows its symptom; `--all-runs` makes
-it do every run, to measure the rate. A fix tracking entry needs every run to
-be clean.
+it do every run, to measure the rate.
 
 ## Results
 
@@ -167,71 +137,108 @@ From a fresh clone, `JOBS=64 TEST_JOBS=8 ./run` (2026-11-06) built everything
 and passed all 40 bug suite tests in 20 minutes. A second pass,
 `./run test --jobs 8 --all-runs all`, did every run of every test: "hang in
 k/n" counts the runs that showed the expected symptom, and "also" lists the
-other symptoms these runs showed. The last column is `TEST_JOBS=8 ./run fixes`
-on the reference series, also from the fresh clone: "clean (n/n)" means every
-run was clean; otherwise it gives the symptoms and how many runs showed them.
+other symptoms these runs showed.
 
-| test | v7.4-rc1 | reference series |
-|---|---|---|
-| `vfio-exit-deadlock` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `vfio-reset-deadlock` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `sysfs-remove-deadlock` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `sriov-disable-deadlock` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `hotadd-lockdep` | lockdep in 1/1 | clean (1/1) |
-| `nested-lockdep` | lockdep in 1/1 | clean (1/1) |
-| `host-reset-deadlock` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `spurious-link-lookup-deadlock` | hang in 2/2 (also fail) | hang, fail in 2/2 |
-| `reset-removal-uaf` | kasan in 4/12 (also fail, lockdep) | clean (2/2) |
-| `reset-adding-device` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `pciehp-unbind-uaf` | kasan in 1/1 (also fail, lockdep) | clean (1/1) |
-| `reset-pciehp-unbind` | hang in 1/1 (also fail) | clean (1/1) |
-| `reset-before-bind` | fail in 1/1 (also lockdep) | clean (1/1) |
-| `reset-after-scan` | fail in 2/4 (also lockdep) | clean (2/2) |
-| `reset-storm` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `reset-during-bind` | hang in 1/1 (also fail, lockdep) | clean (1/1) |
-| `slot-mutex-lockdep` | lockdep in 1/1 | clean (1/1) |
-| `aer-hotadd-race` | hang in 1/1 (also fail, lockdep) | warn, fail in 1/1 |
-| `sysfs-remove-uaf` | kasan in 1/1 (also fail, lockdep) | clean (1/1) |
-| `nested-removal` | hang in 1/6 (also fail, lockdep) | clean (3/3) |
-| `nested-bringup-deadlock` | hang in 2/2 (also fail) | hang, fail in 2/2 |
-| `port-unbind-deadlock` | hang in 2/2 (also fail) | hang, fail in 2/2 |
-| `port-unbind-host-reset` | hang in 2/2 (also fail) | hang, fail in 2/2 |
-| `sriov-recovery-walk-deadlock` | hang in 2/2 (also fail) | hang, fail in 3/3 |
-| `recovery-walk-deadlock` | hang in 2/2 (also fail) | hang, fail in 2/2 |
-| `recovery-hotadd-msix` | warn in 2/2 (also fail, lockdep) | warn, fail in 3/3 |
-| `sriov-remove-abba` | hang in 1/1 (also fail, lockdep) | hang, fail in 2/2 |
-| `sriov-pciehp-abba` | hang in 2/2 (also fail, lockdep) | hang, fail in 2/6 |
-| `dead-link-reset-wait` | fail in 1/1 (also hang, lockdep) | hang, fail in 1/1 |
-| `reset-holds-removing` | hang in 2/2 (also fail) | hang, fail in 3/3 |
-| `reset-holds-probing` | hang in 2/2 (also fail) | hang, fail in 3/3 |
-| `reset-subordinate-uaf` | kasan in 2/2 (also fail) | kasan, warn, fail in 3/3 |
-| `pciehp-rpm-recursion` | hang in 2/2 (also fail, lockdep) | hang, lockdep, fail in 3/3 |
-| `rescan-remove-deadlock` | hang in 2/2 (also fail, lockdep) | hang, lockdep, fail in 3/3 |
-| `sriov-host-reset-deadlock` | hang in 1/1 (also fail, lockdep) | hang, fail in 2/2 |
-| `sriov-linkdown-deadlock` | hang in 2/2 (also fail, lockdep) | hang, fail in 3/3 |
-| `pf-unbind-unlocked-vf-removal` | warn in 1/1 (also fail) | warn, fail in 2/2 |
-| `removal-stall` | fail in 1/1 (also lockdep) | fail in 2/2 |
-| `bind-during-removal` | fail in 1/1 | fail in 2/2 |
-| `shutdown-aer-deadlock` | hang in 1/1 (also fail) | hang, fail in 2/2 |
-| `pciehp-rpm-safe-removal` | - | lockdep in 3/3 |
-| `linkdown-hotadd-bars` | - | clean (3/3) |
-| `pf-probe-sriov-removal` | - | warn in 2/2 |
+| test | v7.4-rc1 |
+|---|---|
+| `vfio-exit-deadlock` | hang in 1/1 (also fail, lockdep) |
+| `vfio-reset-deadlock` | hang in 1/1 (also fail, lockdep) |
+| `sysfs-remove-deadlock` | hang in 1/1 (also fail, lockdep) |
+| `sriov-disable-deadlock` | hang in 1/1 (also fail, lockdep) |
+| `hotadd-lockdep` | lockdep in 1/1 |
+| `nested-lockdep` | lockdep in 1/1 |
+| `host-reset-deadlock` | hang in 1/1 (also fail, lockdep) |
+| `spurious-link-lookup-deadlock` | hang in 2/2 (also fail) |
+| `reset-removal-uaf` | kasan in 4/12 (also fail, lockdep) |
+| `reset-adding-device` | hang in 1/1 (also fail, lockdep) |
+| `pciehp-unbind-uaf` | kasan in 1/1 (also fail, lockdep) |
+| `reset-pciehp-unbind` | hang in 1/1 (also fail) |
+| `reset-before-bind` | fail in 1/1 (also lockdep) |
+| `reset-after-scan` | fail in 2/4 (also lockdep) |
+| `reset-storm` | hang in 1/1 (also fail, lockdep) |
+| `reset-during-bind` | hang in 1/1 (also fail, lockdep) |
+| `slot-mutex-lockdep` | lockdep in 1/1 |
+| `aer-hotadd-race` | hang in 1/1 (also fail, lockdep) |
+| `sysfs-remove-uaf` | kasan in 1/1 (also fail, lockdep) |
+| `nested-removal` | hang in 1/6 (also fail, lockdep) |
+| `nested-bringup-deadlock` | hang in 2/2 (also fail) |
+| `port-unbind-deadlock` | hang in 2/2 (also fail) |
+| `port-unbind-host-reset` | hang in 2/2 (also fail) |
+| `sriov-recovery-walk-deadlock` | hang in 2/2 (also fail) |
+| `recovery-walk-deadlock` | hang in 2/2 (also fail) |
+| `recovery-hotadd-msix` | warn in 2/2 (also fail, lockdep) |
+| `sriov-remove-abba` | hang in 1/1 (also fail, lockdep) |
+| `sriov-pciehp-abba` | hang in 2/2 (also fail, lockdep) |
+| `dead-link-reset-wait` | fail in 1/1 (also hang, lockdep) |
+| `reset-holds-removing` | hang in 2/2 (also fail) |
+| `reset-holds-probing` | hang in 2/2 (also fail) |
+| `reset-subordinate-uaf` | kasan in 2/2 (also fail) |
+| `pciehp-rpm-recursion` | hang in 2/2 (also fail, lockdep) |
+| `rescan-remove-deadlock` | hang in 2/2 (also fail, lockdep) |
+| `sriov-host-reset-deadlock` | hang in 1/1 (also fail, lockdep) |
+| `sriov-linkdown-deadlock` | hang in 2/2 (also fail, lockdep) |
+| `pf-unbind-unlocked-vf-removal` | warn in 1/1 (also fail) |
+| `removal-stall` | fail in 1/1 (also lockdep) |
+| `bind-during-removal` | fail in 1/1 |
+| `shutdown-aer-deadlock` | hang in 1/1 (also fail) |
 
 On v7.4-rc1 most tests show their bug in every run. `reset-removal-uaf`,
 `nested-removal` and `reset-after-scan` are races without a widened window:
 over the three passes run for this table (two from the fresh clone, one in the
 development tree), they showed their bug in 6 of 23, 6 of 13 and 6 of 12 runs,
-which is why the bug suite allows them 16, 12 and 8 runs. The lockdep reports
-in most runs are N1's report on the first hot-add, which then turns lockdep
-off for the rest of the boot.
+which is why the bug suite now allows them 16, 12 and 8 runs (the table's
+`--all-runs` pass had 12, 6 and 4). The lockdep reports in most runs are N1's
+report on the first hot-add, which then turns lockdep off for the rest of the
+boot.
 
-The reference series is clean on the tests of P0, N1, N2 and N4-N9, on
-`nested-removal` (N10) and on `linkdown-hotadd-bars`. With it,
-`aer-hotadd-race` shows N12 instead of hanging on N8,
-`spurious-link-lookup-deadlock` deadlocks through N11 instead of N3, and
-`pciehp-rpm-safe-removal` and `pf-probe-sriov-removal` show N18's lockdep
-report and N21's warning, not regressions. Per-issue status:
-[docs/fix-status.md](docs/fix-status.md).
+## Fix tracking
+
+Fix tracking runs every test of the bug suite on each tree of
+`configs/fix-trees.conf`, expecting every run to be clean, plus regression
+tests that check fix attempts rather than v7.4-rc1 bugs. An entry needs every
+run to be clean.
+
+```sh
+./run fixes                         # fix tracking on configs/fix-trees.conf
+./run fixes --dry-run all           # list the fix tracking matrix
+./run fixes --tree ~/linux@my-fix --name my-fix   # fix tracking on a local tree
+```
+
+`./run fixes --tree PATH[@REV]` tests a commit of a local Linux tree without
+modifying it. Each fix tree is built as `<tree>-hooks`, `<tree>-hooks-kasan`
+and `<tree>-hooks-hc`: every test runs with the TEST ONLY patch, so a tree
+needs a variant of it that applies. The build uses the tree's patch from
+`configs/fix-trees.conf`, or for a local tree the first
+`patches/test-hooks*.patch` that applies (or `--patch FILE`).
+
+The regression tests:
+
+| test | tier | guards against | what it does |
+|---|---|---|---|
+| `pciehp-rpm-safe-removal` | 2 | a fix for N18 that re-enumerates a safely removed card on runtime resume | safe removal (sysfs power=0) of a card in a slot without a power controller while its Root Port is runtime-suspended; the slot must stay off |
+| `linkdown-hotadd-bars` | 2, hc | a fix for N2 or N20 that lets pciehp bind a device between the recovery's error_detected walk and its reset (N12) | a NIC hot-added while the real link-down recovery of its Root Port runs; it must end up bound with its BARs |
+| `pf-probe-sriov-removal` | 2 | a fix that takes pci_rescan_remove_lock while adding VFs and so deadlocks at probe time | a PF driver that enables SR-IOV in `->probe()` (igb max_vfs) is bound while a remover that holds pci_rescan_remove_lock waits for the PF |
+
+It currently tracks a reference fix series, branch
+[`pciehp-reset-fixes`](https://github.com/opsound/linux/tree/pciehp-reset-fixes)
+of https://github.com/opsound/linux, built with
+`patches/test-hooks-pciehp-reset-fixes.patch`. Other trees can be added.
+
+**About the fix series.** It was written and validated with LLM assistance.
+Its author doesn't have enough expertise in pciehp, the PCI core reset code and
+vfio-pci to take it upstream alone, so it is meant as a reference for
+discussion and for whoever fixes these issues, not as a submission. Each
+commit message describes its bug, how the commit fixes it, and how it was
+tested. It fixes P0, N1, N2, N4-N9 and the original N10 deadlock, not N3, the
+N10 variants or N11-N24.
+
+`TEST_JOBS=8 ./run fixes` from the same fresh clone: 19 of 43 entries clean.
+The series is clean on the tests of P0, N1, N2 and N4-N9, on `nested-removal`
+(N10) and on `linkdown-hotadd-bars`. With it, `aer-hotadd-race` shows N12
+instead of hanging on N8, `spurious-link-lookup-deadlock` deadlocks through N11
+instead of N3, and `pciehp-rpm-safe-removal` and `pf-probe-sriov-removal` show
+N18's lockdep report and N21's warning, not regressions. Results per test and
+status per issue: [docs/fix-status.md](docs/fix-status.md).
 
 ## How a test runs
 
