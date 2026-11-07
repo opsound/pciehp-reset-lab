@@ -170,10 +170,11 @@ local_worktree()
 }
 
 # add_tree NAME PATH [REV [PATCH]]: register a local tree for fix tracking.
-# Without PATCH, the first patches/test-hooks*.patch that applies is used.
+# Without PATCH, the first patches/test-hooks*.patch that applies is used,
+# preferring one that applies with full context.
 add_tree()
 {
-	local name="$1" path="$2" rev="${3:-HEAD}" patch="${4:-}" commit p tmp
+	local name="$1" path="$2" rev="${3:-HEAD}" patch="${4:-}" commit p tmp ctx
 	case "${name}" in *[!a-zA-Z0-9_.-]*|mainline*) echo "bad tree name: ${name}" >&2; exit 2 ;; esac
 	path="$(cd "${path}" && pwd)"
 	commit="$(git -C "${path}" rev-parse --verify "${rev}^{commit}")"
@@ -183,15 +184,18 @@ add_tree()
 	fi
 	if [ -z "${patch}" ]; then
 		# Pick the patch in a throwaway index: git apply --cached against
-		# the commit's tree, without touching any work tree.
+		# the commit's tree, without touching any work tree.  The patches
+		# differ only in context, so with reduced context the wrong one
+		# may apply too.
 		tmp="$(mktemp)"
-		for p in "${root}"/patches/test-hooks*.patch; do
-			if GIT_INDEX_FILE="${tmp}" git -C "${path}" read-tree "${commit}" &&
-			   { GIT_INDEX_FILE="${tmp}" git -C "${path}" apply --cached --check "${p}" 2>/dev/null ||
-			     GIT_INDEX_FILE="${tmp}" git -C "${path}" apply --cached --check -C1 "${p}" 2>/dev/null; }; then
-				patch="${p}"
-				break
-			fi
+		GIT_INDEX_FILE="${tmp}" git -C "${path}" read-tree "${commit}"
+		for ctx in "" -C1; do
+			for p in "${root}"/patches/test-hooks*.patch; do
+				if GIT_INDEX_FILE="${tmp}" git -C "${path}" apply --cached --check ${ctx} "${p}" 2>/dev/null; then
+					patch="${p}"
+					break 2
+				fi
+			done
 		done
 		rm -f "${tmp}"
 		[ -n "${patch}" ] || { echo "no patches/test-hooks*.patch applies to ${path} ${commit:0:12}; use --patch" >&2; exit 1; }
