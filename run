@@ -6,6 +6,21 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")" && pwd)"
 action="${1:-all}"
 
+usage()
+{
+	cat >&2 <<EOF
+usage: $0 [all|build|test [OPTIONS] [SELECTION]]
+       $0 fixes [--tree PATH[@REV] [--name NAME] [--patch FILE]] [TREE...] [OPTIONS] [SELECTION]
+  all     build the bug suite's kernels, QEMU and the initramfs, then run the
+          bug suite on v7.4-rc1 (default)
+  build   build only
+  test    run the bug suite (scripts/run-tests.sh --help)
+  fixes   build and run the fix tracking suite on the trees of
+          configs/fix-trees.conf, on the named ones, or on a local tree
+EOF
+	exit 2
+}
+
 case "${action}" in
 all)
 	make -C "${root}" -j"${JOBS:-$(nproc)}" all TEST_JOBS="${TEST_JOBS:-4}"
@@ -17,8 +32,45 @@ test)
 	shift
 	"${root}/scripts/run-tests.sh" "$@"
 	;;
+fixes)
+	shift
+	trees=() opts=() tree_path="" name="" patch=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--tree) [ $# -ge 2 ] || usage; tree_path="$2"; shift 2 ;;
+		--name) [ $# -ge 2 ] || usage; name="$2"; shift 2 ;;
+		--patch) [ $# -ge 2 ] || usage; patch="$2"; shift 2 ;;
+		--jobs|-j|--runs) [ $# -ge 2 ] || usage; opts+=("$1" "$2"); shift 2 ;;
+		--dry-run|--all-runs|--jobs=*) opts+=("$1"); shift ;;
+		-h|--help) usage ;;
+		-*) usage ;;
+		*)
+			if "${root}/scripts/build.sh" list-trees | grep -qx -- "$1"; then
+				trees+=("$1")
+			else
+				opts+=("$1")	# test selection
+			fi
+			shift
+			;;
+		esac
+	done
+	if [ -n "${tree_path}" ]; then
+		rev=HEAD
+		case "${tree_path}" in *@*) rev="${tree_path##*@}"; tree_path="${tree_path%@*}" ;; esac
+		name="${name:-local}"
+		"${root}/scripts/build.sh" add-tree "${name}" "${tree_path}" "${rev}" ${patch:+"${patch}"}
+		trees+=("${name}")
+	fi
+	[ ${#trees[@]} -gt 0 ] || mapfile -t trees < <("${root}/scripts/build.sh" list-trees)
+	case " ${opts[*]} " in
+	*" --dry-run "*) ;;
+	*) make -C "${root}" -j"${JOBS:-$(nproc)}" fixes-build FIX_TREES="${trees[*]}" ;;
+	esac
+	targs=()
+	for t in "${trees[@]}"; do targs+=(--tree "${t}"); done
+	"${root}/scripts/run-tests.sh" --suite fixes "${targs[@]}" --jobs "${TEST_JOBS:-4}" "${opts[@]}"
+	;;
 *)
-	echo "usage: $0 [all|build|test [--jobs N] [--runs N] [--dry-run] [all|<kernel>|<test>|<kernel>:<test>]]" >&2
-	exit 2
+	usage
 	;;
 esac

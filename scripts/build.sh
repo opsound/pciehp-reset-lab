@@ -12,72 +12,197 @@ tools_build="${out}/tools"
 rootfs="${out}/rootfs"
 jobs="${JOBS:-16}"
 cc="${CC:-cc}"
+fix_trees_conf="${root}/configs/fix-trees.conf"
+local_trees_conf="${out}/local-trees.conf"
 
 # shellcheck source=../configs/versions.env
 . "${root}/configs/versions.env"
 busybox_src="${out}/src/busybox-${BUSYBOX_VERSION}"
 
-KERNELS="mainline fixed mainline-kasan fixed-kasan mainline-hooks fixed-hooks
-	mainline-hooks-kasan fixed-hooks-kasan"
+# The bug suite's kernels: v7.4-rc1 as is, and with the TEST ONLY hooks patch.
+BUG_KERNELS="mainline mainline-kasan mainline-hooks mainline-hooks-kasan mainline-hooks-hc"
+# Every fix tree is built as <tree>-hooks, <tree>-hooks-kasan, <tree>-hooks-hc.
+FLAVORS="hooks hooks-kasan hooks-hc"
+# Static guest helpers, tools/<name>.c
+GUEST_TOOLS="vtool wloop"
 
-# Serial git phase: submodules, pins, and generated worktrees.  Runs before
-# any compile so parallel steps never contend on git metadata.
+# Serial git phase: submodules, pins and the generated mainline-hooks tree.
+# Runs before any compile so parallel steps never contend on git metadata.
 fetch_all()
 {
 	if [ ! -e "${linux_src}/.git" ] || [ ! -e "${qemu_src}/.git" ]; then
 		git -C "${root}" submodule update --init --depth 1 \
 			--single-branch linux qemu
 	fi
-	if [ "$(git -C "${linux_src}" rev-parse HEAD)" != "${LINUX_FIXED_COMMIT}" ]; then
-		echo "linux/ is not pinned to LINUX_FIXED_COMMIT; update submodules" >&2
+	if [ "$(git -C "${linux_src}" rev-parse HEAD)" != "${LINUX_MAINLINE_COMMIT}" ]; then
+		echo "linux/ is not pinned to LINUX_MAINLINE_COMMIT; update submodules" >&2
 		exit 1
 	fi
 	if [ "$(git -C "${qemu_src}" rev-parse HEAD)" != "${QEMU_COMMIT}" ]; then
 		echo "qemu/ is not pinned to QEMU_COMMIT; update submodules" >&2
 		exit 1
 	fi
-
 	mkdir -p "${out}/src"
-	ensure_kernel_source mainline "${out}/src/linux-mainline" \
-		"${LINUX_MAINLINE_COMMIT}" "${LINUX_FIXED_REF}"
-	ensure_kernel_source mainline-hooks "${out}/src/linux-mainline-hooks" \
-		"${LINUX_MAINLINE_HOOKS_COMMIT}" "${LINUX_MAINLINE_HOOKS_REF}"
-	ensure_kernel_source fixed-hooks "${out}/src/linux-fixed-hooks" \
-		"${LINUX_FIXED_HOOKS_COMMIT}" "${LINUX_FIXED_HOOKS_REF}"
+	patched_worktree mainline-hooks "${linux_src}" "${LINUX_MAINLINE_COMMIT}" \
+		"${root}/patches/test-hooks.patch"
 	fetch_busybox
 }
 
-ensure_kernel_source() # label worktree commit ref
+# fix_tree NAME: "url ref commit patch" of a fix tree from configs/fix-trees.conf
+# or from a local tree registered by "build.sh add-tree" (url = local path).
+fix_tree()
 {
-	local label="$1" source="$2" commit="$3" ref="$4" rounds=0
-
-	if ! git -C "${linux_src}" cat-file -e "${commit}^{commit}" 2>/dev/null; then
-		echo "==> Fetching the Linux ${label} revision"
-		git -C "${linux_src}" fetch --no-tags --depth=1 origin "${ref}"
-	fi
-	# The pinned commit may sit below the branch tip (mainline is the base
-	# of the fix series); deepen in bounded steps until it is available.
-	while ! git -C "${linux_src}" cat-file -e "${commit}^{commit}" 2>/dev/null; do
-		rounds=$((rounds + 1))
-		if [ "${rounds}" -gt 10 ]; then
-			echo "Linux ${label} commit ${commit} is unavailable from origin" >&2
-			exit 1
-		fi
-		git -C "${linux_src}" fetch --no-tags --deepen=10 origin "${ref}"
+	local f n rest
+	for f in "${fix_trees_conf}" "${local_trees_conf}"; do
+		[ -f "${f}" ] || continue
+		while read -r n rest; do
+			case "${n}" in ''|'#'*) continue ;; esac
+			if [ "${n}" = "$1" ]; then
+				echo "${rest}"
+				return 0
+			fi
+		done < "${f}"
 	done
+	return 1
+}
 
-	if [ -e "${source}/.git" ]; then
-		if [ -n "$(git -C "${source}" status --porcelain)" ]; then
-			echo "generated ${label} worktree is dirty: ${source}" >&2
-			exit 1
+list_trees()
+{
+	local n rest
+	[ -f "${fix_trees_conf}" ] || return 0
+	while read -r n rest; do
+		case "${n}" in ''|'#'*) continue ;; esac
+		echo "${n}"
+	done < "${fix_trees_conf}"
+}
+
+# fetch_trees NAME...: the source of each fix tree, as out/src/NAME-hooks with
+# its hooks patch applied.
+fetch_trees()
+{
+	local name url ref commit patch rounds def
+	for name in "$@"; do
+		def="$(fix_tree "${name}")" || { echo "unknown fix tree: ${name}" >&2; exit 2; }
+		read -r url ref commit patch <<< "${def}"
+		case "${patch}" in /*) ;; *) patch="${root}/${patch}" ;; esac
+		if [ "${ref}" = local ]; then
+			local_worktree "${name}" "${url}" "${commit}" "${patch}"
+			continue
 		fi
-		if [ "$(git -C "${source}" rev-parse HEAD)" != "${commit}" ]; then
-			git -C "${source}" switch --detach "${commit}"
+		rounds=0
+		if ! git -C "${linux_src}" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+			echo "==> Fetching fix tree ${name} (${url} ${ref})"
+			git -C "${linux_src}" fetch --no-tags --depth=1 "${url}" "${ref}"
 		fi
+		# The pinned commit may sit below the branch tip; deepen in bounded
+		# steps until it is available.
+		while ! git -C "${linux_src}" cat-file -e "${commit}^{commit}" 2>/dev/null; do
+			rounds=$((rounds + 1))
+			if [ "${rounds}" -gt 10 ]; then
+				echo "fix tree ${name}: commit ${commit} is unavailable from ${url}" >&2
+				exit 1
+			fi
+			git -C "${linux_src}" fetch --no-tags --deepen=10 "${url}" "${ref}"
+		done
+		patched_worktree "${name}-hooks" "${linux_src}" "${commit}" "${patch}"
+	done
+}
+
+# stamp_ok DIR COMMIT PATCH: DIR is at COMMIT with PATCH applied by us
+stamp_ok()
+{
+	[ -f "$1.stamp" ] && [ "$(cat "$1.stamp")" = "$2 $(sha256sum < "$3" | cut -d' ' -f1)" ]
+}
+
+apply_patch() # dir patch commit
+{
+	local dir="$1" patch="$2"
+	if git -C "${dir}" apply --check "${patch}" 2>/dev/null; then
+		git -C "${dir}" apply "${patch}"
+	elif git -C "${dir}" apply --check -C1 "${patch}" 2>/dev/null; then
+		echo "==> ${patch##*/}: applying with reduced context to ${dir##*/}"
+		git -C "${dir}" apply -C1 "${patch}"
 	else
-		git -C "${linux_src}" worktree prune
-		git -C "${linux_src}" worktree add --detach "${source}" "${commit}"
+		git -C "${dir}" apply --check -C1 "${patch}" || true
+		echo "${patch} does not apply to ${dir} ($3)" >&2
+		exit 1
 	fi
+	echo "$3 $(sha256sum < "${patch}" | cut -d' ' -f1)" > "${dir}.stamp"
+}
+
+# patched_worktree NAME REPO COMMIT PATCH: out/src/NAME, a detached worktree of
+# REPO at COMMIT with PATCH applied.
+patched_worktree()
+{
+	local name="$1" repo="$2" commit="$3" patch="$4" dir="${out}/src/$1"
+
+	[ -f "${patch}" ] || { echo "missing patch ${patch}" >&2; exit 1; }
+	if [ -e "${dir}/.git" ]; then
+		stamp_ok "${dir}" "${commit}" "${patch}" && return 0
+		echo "==> Resetting ${name} to ${commit:0:12}"
+		git -C "${dir}" checkout -q -f --detach "${commit}"
+		git -C "${dir}" clean -q -fd
+	else
+		echo "==> Creating ${name} at ${commit:0:12}"
+		git -C "${repo}" worktree prune
+		git -C "${repo}" worktree add -q --detach "${dir}" "${commit}"
+	fi
+	apply_patch "${dir}" "${patch}" "${commit}"
+}
+
+# local_worktree NAME PATH COMMIT PATCH: out/src/NAME-hooks, a clone of the local
+# tree PATH sharing its objects (PATH itself is not modified), at COMMIT.
+local_worktree()
+{
+	local name="$1" path="$2" commit="$3" patch="$4" dir="${out}/src/$1-hooks"
+
+	if [ -e "${dir}/.git" ]; then
+		stamp_ok "${dir}" "${commit}" "${patch}" && return 0
+		# The clone borrows PATH's objects (--shared), so COMMIT is there.
+		git -C "${dir}" checkout -q -f --detach "${commit}"
+		git -C "${dir}" clean -q -fd
+	else
+		echo "==> Cloning ${path} (${commit:0:12}) as ${name}-hooks"
+		git clone -q --shared --no-checkout "${path}" "${dir}"
+		git -C "${dir}" checkout -q --detach "${commit}"
+	fi
+	apply_patch "${dir}" "${patch}" "${commit}"
+}
+
+# add_tree NAME PATH [REV [PATCH]]: register a local tree for fix tracking.
+# Without PATCH, the first patches/test-hooks*.patch that applies is used.
+add_tree()
+{
+	local name="$1" path="$2" rev="${3:-HEAD}" patch="${4:-}" commit p tmp
+	case "${name}" in *[!a-zA-Z0-9_.-]*|mainline*) echo "bad tree name: ${name}" >&2; exit 2 ;; esac
+	path="$(cd "${path}" && pwd)"
+	commit="$(git -C "${path}" rev-parse --verify "${rev}^{commit}")"
+	if [ -n "$(git -C "${path}" status --porcelain --untracked-files=no 2>/dev/null)" ] &&
+	   [ "${rev}" = HEAD ]; then
+		echo "note: ${path} has uncommitted changes; testing its HEAD ${commit:0:12}" >&2
+	fi
+	if [ -z "${patch}" ]; then
+		# Pick the patch in a throwaway index: git apply --cached against
+		# the commit's tree, without touching any work tree.
+		tmp="$(mktemp)"
+		for p in "${root}"/patches/test-hooks*.patch; do
+			if GIT_INDEX_FILE="${tmp}" git -C "${path}" read-tree "${commit}" &&
+			   { GIT_INDEX_FILE="${tmp}" git -C "${path}" apply --cached --check "${p}" 2>/dev/null ||
+			     GIT_INDEX_FILE="${tmp}" git -C "${path}" apply --cached --check -C1 "${p}" 2>/dev/null; }; then
+				patch="${p}"
+				break
+			fi
+		done
+		rm -f "${tmp}"
+		[ -n "${patch}" ] || { echo "no patches/test-hooks*.patch applies to ${path} ${commit:0:12}; use --patch" >&2; exit 1; }
+	fi
+	case "${patch}" in /*) ;; *) patch="$(cd "$(dirname "${patch}")" && pwd)/${patch##*/}" ;; esac
+	mkdir -p "${out}/src"
+	touch "${local_trees_conf}"
+	grep -v "^${name} " "${local_trees_conf}" > "${local_trees_conf}.tmp" || true
+	echo "${name} ${path} local ${commit} ${patch}" >> "${local_trees_conf}.tmp"
+	mv "${local_trees_conf}.tmp" "${local_trees_conf}"
+	echo "==> Tree ${name}: ${path} ${commit:0:12}, ${patch##*/}"
 }
 
 fetch_busybox()
@@ -101,28 +226,29 @@ fetch_busybox()
 kernel_source() # name
 {
 	case "$1" in
-	mainline|mainline-kasan) echo "${out}/src/linux-mainline" ;;
-	fixed|fixed-kasan) echo "${linux_src}" ;;
-	mainline-hooks|mainline-hooks-kasan) echo "${out}/src/linux-mainline-hooks" ;;
-	fixed-hooks|fixed-hooks-kasan) echo "${out}/src/linux-fixed-hooks" ;;
+	mainline|mainline-kasan) echo "${linux_src}" ;;
+	*-hooks|*-hooks-kasan|*-hooks-hc) echo "${out}/src/${1%-hooks*}-hooks" ;;
 	*) echo "unknown kernel: $1" >&2; exit 2 ;;
 	esac
 }
 
 build_one_kernel() # name
 {
-	local name="$1" source build="${out}/linux-$1"
+	local name="$1" source build="${out}/linux-$1" frag=
 
 	source="$(kernel_source "${name}")"
+	[ -e "${source}/Makefile" ] || { echo "no source for ${name}: ${source} (run fetch first)" >&2; exit 1; }
 	echo "==> Building Linux ${name} ($(git -C "${source}" rev-parse --short HEAD))"
 	mkdir -p "${build}"
 	install -m 0644 "${root}/configs/linux-x86_64.config" "${build}/.config"
 	case "${name}" in
-	*-kasan)
-		"${source}/scripts/kconfig/merge_config.sh" -m -O "${build}" \
-			"${build}/.config" "${root}/configs/kasan.config"
-		;;
+	*-kasan) frag="${root}/configs/kasan.config" ;;
+	*-hc) frag="${root}/configs/hc.config" ;;
 	esac
+	if [ -n "${frag}" ]; then
+		"${source}/scripts/kconfig/merge_config.sh" -m -O "${build}" \
+			"${build}/.config" "${frag}"
+	fi
 	make -C "${source}" O="${build}" olddefconfig
 	case "${MAKEFLAGS:-}" in
 	*jobserver*)
@@ -175,15 +301,18 @@ build_busybox()
 
 build_tools()
 {
+	local t
 	echo "==> Building static guest tools"
 	mkdir -p "${tools_build}"
-	"${cc}" -O2 -g -Wall -Wextra -static -o "${tools_build}/vtool" \
-		"${root}/tools/vtool.c"
+	for t in ${GUEST_TOOLS}; do
+		"${cc}" -O2 -g -Wall -Wextra -static -o "${tools_build}/${t}" \
+			"${root}/tools/${t}.c"
+	done
 }
 
 build_initramfs()
 {
-	local applet
+	local applet t
 
 	echo "==> Building initramfs"
 	rm -rf -- "${rootfs}"
@@ -193,7 +322,9 @@ build_initramfs()
 	for applet in $("${out}/busybox/busybox" --list); do
 		[ -e "${rootfs}/bin/${applet}" ] || ln -s busybox "${rootfs}/bin/${applet}"
 	done
-	install -m 0755 "${tools_build}/vtool" "${rootfs}/bin/vtool"
+	for t in ${GUEST_TOOLS}; do
+		install -m 0755 "${tools_build}/${t}" "${rootfs}/bin/"
+	done
 	install -m 0755 "${root}/guest/init" "${rootfs}/init"
 	install -m 0644 "${root}/guest/lib.sh" "${root}/guest/scn/"*.sh "${rootfs}/scn/"
 	(
@@ -204,14 +335,22 @@ build_initramfs()
 
 usage()
 {
-	echo "usage: $0 [all|fetch|kernel <name>|qemu|busybox|tools|initramfs]" >&2
-	echo "  kernels: ${KERNELS}" >&2
+	echo "usage: $0 [all|fetch|fetch-trees TREE...|add-tree NAME PATH [REV [PATCH]]|list-trees|" >&2
+	echo "          kernel NAME|qemu|busybox|tools|initramfs]" >&2
+	echo "  bug suite kernels: ${BUG_KERNELS}" >&2
+	echo "  fix tree kernels: TREE-{${FLAVORS// /,}} for TREE in: $(list_trees | tr '\n' ' ')" >&2
 	exit 2
 }
 
 step="${1:-all}"
 case "${step}" in
 fetch) fetch_all ;;
+fetch-trees) shift; fetch_trees "$@" ;;
+add-tree)
+	[ $# -ge 3 ] || usage
+	add_tree "${@:2}"
+	;;
+list-trees) list_trees ;;
 kernel)
 	[ $# -ge 2 ] || usage
 	build_one_kernel "$2"
@@ -222,7 +361,7 @@ tools) build_tools ;;
 initramfs) build_initramfs ;;
 all)
 	fetch_all
-	for k in ${KERNELS}; do
+	for k in ${BUG_KERNELS}; do
 		build_one_kernel "${k}"
 	done
 	build_qemu

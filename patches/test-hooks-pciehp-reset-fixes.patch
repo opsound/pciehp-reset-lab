@@ -1,0 +1,686 @@
+TEST ONLY: PCI: debugfs hooks and delays for pciehp-reset-lab
+
+Not for upstream.  Builds drivers/pci/pcitest_hooks.c into the kernel and
+adds delay knobs to pciehp, pci_device_add() and pci_device_probe(), for the
+reproducers of https://github.com/opsound/pciehp-reset-lab that QEMU can't
+trigger otherwise.  Every hook and knob is inert until written to:
+
+- /sys/kernel/debug/pcitest/host_reset emulates pci_host_reset_root_port(),
+  which takes pci_rescan_remove_lock and resets the Root Port's slot; QEMU's
+  q35 has no host-common link-down handling.  link_down (only with
+  CONFIG_PCI_HOST_GENERIC=y) runs the real pci-host-common link-down
+  recovery for the Root Ports of the device's host bridge.
+- err_reset, aer_reset and aer_host_reset emulate AER/DPC recovery resets
+  (pci_bus_error_reset(), pcie_do_recovery()); aer_link_delay_ms widens the
+  window between the error_detected walk and the reset.
+- slot_reset calls the hotplug slot's ->reset_slot() directly.
+- hold_rescan_ms holds pci_rescan_remove_lock; remove_locked removes a
+  device with the lock held across the whole removal.
+- rpm_allow lets a port without a PM capability runtime suspend.
+- pciehp test_pre_scan_ms/test_post_scan_ms, pcitest/add_delay_ms and
+  pcitest/probe_delay_ms widen the windows before and after pciehp scans a
+  hot-added slot, between pci_device_add() putting a device on bus->devices
+  and device_add(), and inside a driver's probe.
+
+Applies to the pciehp-reset-fixes branch of https://github.com/opsound/linux
+(f1ceb362d0e9), whose pciehp_pci.c differs from v7.4-rc1 near the
+post-scan call site.
+Apply with "git apply" or "patch -p1".  The lab's build applies it to the
+kernels whose names contain "hooks".
+---
+ drivers/pci/Makefile                    |   5 +
+ drivers/pci/hotplug/Makefile            |   3 +
+ drivers/pci/hotplug/pciehp_pci.c        |   4 +
+ drivers/pci/hotplug/pciehp_test_knobs.c |  66 ++++
+ drivers/pci/pci-driver.c                |   3 +
+ drivers/pci/pcitest_hooks.c             | 474 ++++++++++++++++++++++++
+ drivers/pci/probe.c                     |   3 +
+ 7 files changed, 558 insertions(+)
+
+diff --git a/drivers/pci/Makefile b/drivers/pci/Makefile
+index 41ebc3b9a518..bf2ed972912e 100644
+--- a/drivers/pci/Makefile
++++ b/drivers/pci/Makefile
+@@ -51,3 +51,8 @@ subdir-ccflags-$(CONFIG_PCI_DEBUG) := -DDEBUG
+ 
+ CFLAGS_trace.o := -I$(src)
+ obj-$(CONFIG_TRACING)		+= trace.o
++
++# TEST ONLY (pciehp-reset-lab)
++obj-y += pcitest_hooks.o
++CFLAGS_pcitest_hooks.o += $(if $(shell grep -s pci_host_handle_link_down_all \
++	$(srctree)/drivers/pci/controller/pci-host-common.h),-DPCITEST_LINK_DOWN_ALL)
+diff --git a/drivers/pci/hotplug/Makefile b/drivers/pci/hotplug/Makefile
+index 40aaf31fe338..6e1ddf1909c8 100644
+--- a/drivers/pci/hotplug/Makefile
++++ b/drivers/pci/hotplug/Makefile
+@@ -72,3 +72,6 @@ shpchp-objs		:=	shpchp_core.o	\
+ 				shpchp_pci.o	\
+ 				shpchp_sysfs.o	\
+ 				shpchp_hpc.o
++
++# TEST ONLY (pciehp-reset-lab)
++pciehp-objs += pciehp_test_knobs.o
+diff --git a/drivers/pci/hotplug/pciehp_pci.c b/drivers/pci/hotplug/pciehp_pci.c
+index a6cded8cf94d..246d8de92917 100644
+--- a/drivers/pci/hotplug/pciehp_pci.c
++++ b/drivers/pci/hotplug/pciehp_pci.c
+@@ -21,6 +21,8 @@
+ #include "../pci.h"
+ #include "pciehp.h"
+ 
++void pciehp_test_delay(struct controller *ctrl, bool post);	/* TEST ONLY (pciehp-reset-lab) */
++
+ /**
+  * pciehp_configure_device() - enumerate PCI devices below a hotplug bridge
+  * @ctrl: PCIe hotplug controller
+@@ -72,6 +74,7 @@ int pciehp_configure_device(struct controller *ctrl)
+ 		goto out;
+ 	}
+ 
++	pciehp_test_delay(ctrl, false);	/* TEST ONLY (pciehp-reset-lab) */
+ 	num = pci_scan_slot(parent, PCI_DEVFN(0, 0));
+ 	if (num == 0) {
+ 		ctrl_err(ctrl, "No new device found\n");
+@@ -84,6 +87,7 @@ int pciehp_configure_device(struct controller *ctrl)
+ 
+ 	pci_assign_unassigned_bridge_resources(bridge);
+ 	pcie_bus_configure_settings(parent);
++	pciehp_test_delay(ctrl, true);	/* TEST ONLY (pciehp-reset-lab) */
+ 
+ 	dev = pci_get_slot(parent, PCI_DEVFN(0, 0));
+ 	ctrl->dsn = dev ? pci_get_dsn(dev) : 0;
+diff --git a/drivers/pci/hotplug/pciehp_test_knobs.c b/drivers/pci/hotplug/pciehp_test_knobs.c
+new file mode 100644
+index 000000000000..085a3f1d1dd9
+--- /dev/null
++++ b/drivers/pci/hotplug/pciehp_test_knobs.c
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TEST ONLY, not for upstream.  pciehp knobs for the reproducers of
++ * https://github.com/opsound/pciehp-reset-lab, kept out of pciehp_pci.c so
++ * that only two one-line calls depend on the tree's pciehp_pci.c.  Linked
++ * into pciehp, so the parameters appear as
++ * /sys/module/pciehp/parameters/test_*:
++ *
++ * test_pre_scan_ms:  pciehp_configure_device() sleeps this long right before
++ *	pci_scan_slot(), with whatever locks the tree holds there
++ *	(reset_lock and pci_rescan_remove_lock in v7.4-rc1).
++ * test_post_scan_ms: likewise right after pcie_bus_configure_settings(),
++ *	i.e. after the scan and resource assignment, before driver binding.
++ * test_error_reset:  writing "BDF" calls pci_bus_error_reset() on the port
++ *	like AER recovery, without holding any lock (same as writing "BDF 0"
++ *	to /sys/kernel/debug/pcitest/host_reset_nolock).
++ *
++ * Both delays log "test: sleeping N ms before|after scan", which scenarios
++ * wait for.
++ */
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include <linux/moduleparam.h>
++#include <linux/pci.h>
++#include "../pci.h"
++#include "pciehp.h"
++
++static unsigned int test_pre_scan_ms, test_post_scan_ms;
++module_param(test_pre_scan_ms, uint, 0644);
++module_param(test_post_scan_ms, uint, 0644);
++
++void pciehp_test_delay(struct controller *ctrl, bool post);
++void pciehp_test_delay(struct controller *ctrl, bool post)
++{
++	unsigned int ms = post ? READ_ONCE(test_post_scan_ms) :
++				 READ_ONCE(test_pre_scan_ms);
++
++	if (!ms)
++		return;
++	ctrl_info(ctrl, "test: sleeping %u ms %s scan\n", ms,
++		  post ? "after" : "before");
++	msleep(ms);
++}
++
++static int test_error_reset_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int dom, bus, slot, fn;
++	struct pci_dev *dev;
++	int ret;
++
++	if (sscanf(val, "%x:%x:%x.%x", &dom, &bus, &slot, &fn) != 4)
++		return -EINVAL;
++	dev = pci_get_domain_bus_and_slot(dom, bus, PCI_DEVFN(slot, fn));
++	if (!dev)
++		return -ENODEV;
++	pr_info("pciehp test: pci_bus_error_reset(%s)\n", pci_name(dev));
++	ret = pci_bus_error_reset(dev);
++	pr_info("pciehp test: pci_bus_error_reset(%s) = %d\n", pci_name(dev), ret);
++	pci_dev_put(dev);
++	return 0;
++}
++
++static const struct kernel_param_ops test_error_reset_ops = {
++	.set = test_error_reset_set,
++};
++module_param_cb(test_error_reset, &test_error_reset_ops, NULL, 0200);
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 7efe808cdf0c..6e1e688f166d 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -24,6 +24,8 @@
+ #include "pci.h"
+ #include "pcie/portdrv.h"
+ 
++void pcitest_probe_delay(struct pci_dev *dev);	/* TEST ONLY (pciehp-reset-lab) */
++
+ struct pci_dynid {
+ 	struct list_head node;
+ 	struct pci_device_id id;
+@@ -502,6 +504,7 @@ static int pci_device_probe(struct device *dev)
+ 	if (!pci_device_can_probe(pci_dev))
+ 		return -ENODEV;
+ 
++	pcitest_probe_delay(pci_dev);	/* TEST ONLY (pciehp-reset-lab) */
+ 	pci_assign_irq(pci_dev);
+ 
+ 	error = pcibios_alloc_irq(pci_dev);
+diff --git a/drivers/pci/pcitest_hooks.c b/drivers/pci/pcitest_hooks.c
+new file mode 100644
+index 000000000000..bf05e2a92b8b
+--- /dev/null
++++ b/drivers/pci/pcitest_hooks.c
+@@ -0,0 +1,474 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Test-only hooks for the pciehp/vfio/PCI-reset deadlock reproducers of
++ * https://github.com/opsound/pciehp-reset-lab.  Not for upstream.  Every
++ * entry takes a BDF of the form DDDD:BB:SS.F where it names a device.
++ *
++ * /sys/kernel/debug/pcitest/hold_rescan_ms: "N" holds pci_rescan_remove_lock
++ *	for N ms in the writing task, emulating a slow topology change.
++ * /sys/kernel/debug/pcitest/host_reset: "BDF MS" takes pci_rescan_remove_lock,
++ *	sleeps MS ms, then calls pci_bus_error_reset() on the port, emulating
++ *	pci_host_reset_root_port() (drivers/pci/controller/pci-host-common.c).
++ * /sys/kernel/debug/pcitest/host_reset_nolock: "BDF MS" sleeps MS ms, then
++ *	calls pci_bus_error_reset() without pci_rescan_remove_lock, emulating
++ *	pci_host_reset_root_port() without the lock, and aer_root_reset().
++ * /sys/kernel/debug/pcitest/slot_reset: "BDF" calls the ->reset_slot() op of
++ *	the hotplug slot below the port directly, under pci_cfg_access_lock()
++ *	of the port but without pci_slot_mutex or device locks, to observe
++ *	reset_lock exclusion alone.
++ * /sys/kernel/debug/pcitest/disconnect: "BDF" marks the device and its
++ *	subordinates disconnected, as pciehp_unconfigure_device() does before
++ *	taking pci_rescan_remove_lock on surprise removal.  Lets a safe removal
++ *	in QEMU emulate a surprise one.
++ * /sys/kernel/debug/pcitest2/slot_reset: "BDF" like pcitest/slot_reset but
++ *	without pci_cfg_access_lock(), so that reset_lock is the only lock the
++ *	reset can block on.  Returns -ENOTTY if there is no hotplug slot.
++ * /sys/kernel/debug/pcitest/aer_reset, aer_host_reset: "BDF [MS]" like err_reset/host_reset,
++ *   but through pcie_do_recovery(), so drivers restore their devices
++ * /sys/kernel/debug/pcitest/err_reset: "BDF [MS]" sleeps MS
++ *	ms, then pci_bus_error_reset() without pci_rescan_remove_lock, like
++ *	AER/DPC recovery (same as host_reset_nolock, different log line).
++ * /sys/kernel/debug/pcitest/reset_bus: "BDF [MS]" sleeps MS
++ *	ms, then pci_reset_bus() on the device (like VFIO_DEVICE_PCI_HOT_RESET).
++ * /sys/kernel/debug/pcitest/aer_link_delay_ms (u32): aer_reset sleeps this
++ *	long between the error_detected walk and pci_bus_error_reset(), with no
++ *	PCI lock held.  0 (off) by default.
++ * /sys/kernel/debug/pcitest/remove_locked: "BDF [MS]" sleeps MS ms, then
++ *	pci_stop_and_remove_bus_device() under pci_rescan_remove_lock, like the
++ *	removers that unbind drivers with the lock held (acpiphp, host bridge
++ *	removal).
++ * /sys/kernel/debug/pcitest/rpm_allow: "BDF" sets bridge_d3 on a port without
++ *	a PM capability (QEMU's ports have none) and requests idle, so that it
++ *	runtime suspends (status only, it stays in D0) once idle.  Needs
++ *	pcie_port_pm=force, so that portdrv allows runtime PM.
++ * /sys/kernel/debug/pcitest/link_down: "BDF [MS]" (only if pci-host-common is
++ *	built in: CONFIG_PCI_HOST_GENERIC=y) sleeps MS ms, then runs the link-down
++ *	recovery of drivers/pci/controller/pci-host-common.c for every Root Port
++ *	of the device's host bridge: pci_host_handle_link_down_all() where the
++ *	tree has it, else the loop that pcie-qcom.c and pcie-dw-rockchip.c use
++ *	(pci_host_handle_link_down() per Root Port).  Logs
++ *	"pcitest: link_down BDF: done".
++ *
++ * Test-only delays in the call sites that the patch adds:
++ * /sys/kernel/debug/pcitest/add_delay_ms (u32): sleep in
++ *	pci_device_add() between list_add_tail() to bus->devices and
++ *	device_add(), for PCIe endpoints; logs "pcitest: add delay BDF N ms".
++ * /sys/kernel/debug/pcitest/probe_delay_ms (u32): one-shot: the next
++ *	pci_device_probe() of a PCIe endpoint sleeps N ms, with the device lock
++ *	held as in every probe; logs "pcitest: probe delay BDF N ms".
++ */
++#include <linux/debugfs.h>
++#include <linux/delay.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/pci_hotplug.h>
++#include <linux/pm_runtime.h>
++#include <linux/uaccess.h>
++#include "pci.h"
++#if IS_BUILTIN(CONFIG_PCI_HOST_COMMON)
++#include "controller/pci-host-common.h"
++#endif
++
++/* Parse "DDDD:BB:SS.F [MS]" from user space; returns a referenced pci_dev. */
++static struct pci_dev *pcitest_get_dev(const char __user *ubuf, size_t len,
++				       unsigned int *ms, int *err)
++{
++	unsigned int dom, bus, slot, fn, dummy;
++	struct pci_dev *dev;
++	char buf[64];
++
++	*err = -EINVAL;
++	if (len >= sizeof(buf))
++		return NULL;
++	*err = -EFAULT;
++	if (copy_from_user(buf, ubuf, len))
++		return NULL;
++	buf[len] = 0;
++	*err = -EINVAL;
++	if (ms)
++		*ms = 0;
++	if (sscanf(buf, "%x:%x:%x.%x %u", &dom, &bus, &slot, &fn, ms ? ms : &dummy) < 4)
++		return NULL;
++	*err = -ENODEV;
++	dev = pci_get_domain_bus_and_slot(dom, bus, PCI_DEVFN(slot, fn));
++	if (dev)
++		*err = 0;
++	return dev;
++}
++
++static ssize_t hold_write(struct file *f, const char __user *ubuf, size_t len,
++			  loff_t *ppos)
++{
++	unsigned int ms;
++	int ret = kstrtouint_from_user(ubuf, len, 0, &ms);
++
++	if (ret)
++		return ret;
++	pr_info("pcitest: hold_rescan %u ms: locking\n", ms);
++	pci_lock_rescan_remove();
++	pr_info("pcitest: hold_rescan: locked\n");
++	msleep(ms);
++	pci_unlock_rescan_remove();
++	pr_info("pcitest: hold_rescan: unlocked\n");
++	return len;
++}
++
++static ssize_t host_reset_write(struct file *f, const char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	pr_info("pcitest: host_reset %s: locking rescan\n", pci_name(dev));
++	pci_lock_rescan_remove();
++	pr_info("pcitest: host_reset %s: locked, sleeping %u ms\n", pci_name(dev), ms);
++	msleep(ms);
++	pr_info("pcitest: host_reset %s: pci_bus_error_reset\n", pci_name(dev));
++	ret = pci_bus_error_reset(dev);
++	pci_unlock_rescan_remove();
++	pr_info("pcitest: host_reset %s: done ret=%d\n", pci_name(dev), ret);
++	pci_dev_put(dev);
++	return ret ? ret : len;
++}
++
++static ssize_t host_reset_nolock_write(struct file *f, const char __user *ubuf,
++				       size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	msleep(ms);
++	pr_info("pcitest: host_reset_nolock %s: pci_bus_error_reset\n", pci_name(dev));
++	ret = pci_bus_error_reset(dev);
++	pr_info("pcitest: host_reset_nolock %s: done ret=%d\n", pci_name(dev), ret);
++	pci_dev_put(dev);
++	return ret ? ret : len;
++}
++
++static struct hotplug_slot *pcitest_hotplug_slot(struct pci_dev *dev)
++{
++	struct hotplug_slot *hp = NULL;
++	struct pci_slot *ps;
++
++	mutex_lock(&pci_slot_mutex);
++	if (dev->subordinate)
++		list_for_each_entry(ps, &dev->subordinate->slots, list)
++			if (ps->hotplug)
++				hp = ps->hotplug;
++	mutex_unlock(&pci_slot_mutex);
++	return hp;
++}
++
++static ssize_t slot_reset_write(struct file *f, const char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct hotplug_slot *hp;
++	struct pci_dev *dev;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, NULL, &ret);
++	if (!dev)
++		return ret;
++	ret = -ENODEV;
++	hp = pcitest_hotplug_slot(dev);
++	if (hp && hp->ops->reset_slot) {
++		pr_info("pcitest: slot_reset %s: start\n", pci_name(dev));
++		pci_cfg_access_lock(dev);
++		ret = hp->ops->reset_slot(hp, false);
++		pci_cfg_access_unlock(dev);
++		pr_info("pcitest: slot_reset %s: done ret=%d\n", pci_name(dev), ret);
++	}
++	pci_dev_put(dev);
++	return ret ? ret : len;
++}
++
++static ssize_t slot_reset2_write(struct file *f, const char __user *ubuf,
++				 size_t len, loff_t *ppos)
++{
++	struct hotplug_slot *hp;
++	struct pci_dev *dev;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, NULL, &ret);
++	if (!dev)
++		return ret;
++	hp = pcitest_hotplug_slot(dev);
++	if (!hp || !hp->ops->reset_slot) {
++		pci_dev_put(dev);
++		return -ENOTTY;
++	}
++	pr_info("pcitest2: slot_reset %s: start\n", pci_name(dev));
++	ret = hp->ops->reset_slot(hp, false);
++	pr_info("pcitest2: slot_reset %s: done ret=%d\n", pci_name(dev), ret);
++	pci_dev_put(dev);
++	return ret ? ret : len;
++}
++
++static ssize_t disconnect_write(struct file *f, const char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, NULL, &ret);
++	if (!dev)
++		return ret;
++	pr_info("pcitest: marking %s disconnected\n", pci_name(dev));
++	pci_dev_set_disconnected(dev, NULL);
++	if (dev->subordinate)
++		pci_walk_bus(dev->subordinate, pci_dev_set_disconnected, NULL);
++	pci_dev_put(dev);
++	return len;
++}
++
++static ssize_t err_reset_write(struct file *f, const char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	msleep(ms);
++	ret = pci_bus_error_reset(dev);
++	pr_info("pcitest: err_reset %s: ret=%d\n", pci_name(dev), ret);
++	pci_dev_put(dev);
++	return ret ? ret : len;
++}
++
++/*
++ * AER-faithful variants of err_reset/host_reset: run the error recovery that
++ * aer_root_reset()/pci_host_reset_root_port() are called from, so drivers get
++ * error_detected/slot_reset/resume and restore their devices.
++ */
++/* 0 (off) by default */
++static u32 pcitest_aer_link_delay_ms;
++
++static pci_ers_result_t pcitest_aer_reset_link(struct pci_dev *dev)
++{
++	u32 ms = READ_ONCE(pcitest_aer_link_delay_ms);
++
++	if (ms) {
++		pr_info("pcitest: aer_reset %s: link delay %u ms\n", pci_name(dev), ms);
++		msleep(ms);
++		pr_info("pcitest: aer_reset %s: pci_bus_error_reset\n", pci_name(dev));
++	}
++	return pci_bus_error_reset(dev) ? PCI_ERS_RESULT_DISCONNECT :
++					  PCI_ERS_RESULT_RECOVERED;
++}
++
++static pci_ers_result_t pcitest_aer_host_reset_link(struct pci_dev *dev)
++{
++	int ret;
++
++	pci_lock_rescan_remove();
++	ret = pci_bus_error_reset(dev);
++	pci_unlock_rescan_remove();
++	return ret ? PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_RECOVERED;
++}
++
++static ssize_t pcitest_aer_common(const char __user *ubuf, size_t len,
++				  pci_ers_result_t (*reset)(struct pci_dev *),
++				  const char *what)
++{
++	pci_ers_result_t status;
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	msleep(ms);
++	status = pcie_do_recovery(dev, pci_channel_io_frozen, reset);
++	pr_info("pcitest: %s %s: status=%u\n", what, pci_name(dev), status);
++	pci_dev_put(dev);
++	return status == PCI_ERS_RESULT_RECOVERED ? len : -EIO;
++}
++
++static ssize_t aer_reset_write(struct file *f, const char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	return pcitest_aer_common(ubuf, len, pcitest_aer_reset_link, "aer_reset");
++}
++
++static ssize_t aer_host_reset_write(struct file *f, const char __user *ubuf,
++				    size_t len, loff_t *ppos)
++{
++	return pcitest_aer_common(ubuf, len, pcitest_aer_host_reset_link,
++				  "aer_host_reset");
++}
++
++static ssize_t reset_bus_write(struct file *f, const char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	msleep(ms);
++	ret = pci_reset_bus(dev);
++	pr_info("pcitest: reset_bus %s: ret=%d\n", pci_name(dev), ret);
++	pci_dev_put(dev);
++	return ret ? ret : len;
++}
++
++/* A remover that holds pci_rescan_remove_lock across the whole removal */
++static ssize_t remove_locked_write(struct file *f, const char __user *ubuf,
++				   size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	msleep(ms);
++	pr_info("pcitest: remove_locked %s: locking rescan\n", pci_name(dev));
++	pci_lock_rescan_remove();
++	pr_info("pcitest: remove_locked %s: locked, removing\n", pci_name(dev));
++	pci_stop_and_remove_bus_device(dev);
++	pci_unlock_rescan_remove();
++	pr_info("pcitest: remove_locked %s: done\n", pci_name(dev));
++	pci_dev_put(dev);
++	return len;
++}
++
++/* Let a port without a PM capability runtime suspend */
++static ssize_t rpm_allow_write(struct file *f, const char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, NULL, &ret);
++	if (!dev)
++		return ret;
++	dev->bridge_d3 = 1;
++	pm_request_idle(&dev->dev);
++	pr_info("pcitest: rpm_allow %s\n", pci_name(dev));
++	pci_dev_put(dev);
++	return len;
++}
++
++#if IS_BUILTIN(CONFIG_PCI_HOST_COMMON)
++/* The link-down recovery of pci-host-common.c */
++static ssize_t link_down_write(struct file *f, const char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	struct pci_dev *dev;
++	unsigned int ms;
++	int ret;
++#ifndef PCITEST_LINK_DOWN_ALL
++	struct pci_dev *port;
++#endif
++
++	dev = pcitest_get_dev(ubuf, len, &ms, &ret);
++	if (!dev)
++		return ret;
++	msleep(ms);
++#ifdef PCITEST_LINK_DOWN_ALL
++	pr_info("pcitest: link_down %s: pci_host_handle_link_down_all\n", pci_name(dev));
++	pci_host_handle_link_down_all(pci_find_host_bridge(dev->bus));
++#else
++	/* What pcie-qcom.c and pcie-dw-rockchip.c do */
++	pr_info("pcitest: link_down %s: pci_host_handle_link_down per Root Port\n", pci_name(dev));
++	for_each_pci_bridge(port, pci_find_host_bridge(dev->bus)->bus)
++		if (pci_pcie_type(port) == PCI_EXP_TYPE_ROOT_PORT)
++			pci_host_handle_link_down(port);
++#endif
++	pr_info("pcitest: link_down %s: done\n", pci_name(dev));
++	pci_dev_put(dev);
++	return len;
++}
++static const struct file_operations link_down_fops = { .write = link_down_write };
++#endif
++
++/* Called from the call sites that the TEST ONLY patch inserts. */
++unsigned int pcitest_add_delay_ms;
++
++void pcitest_add_delay(struct pci_dev *dev);
++void pcitest_add_delay(struct pci_dev *dev)
++{
++	unsigned int ms = READ_ONCE(pcitest_add_delay_ms);
++
++	if (!ms || !pci_is_pcie(dev) || pci_pcie_type(dev) != PCI_EXP_TYPE_ENDPOINT)
++		return;
++	pr_info("pcitest: add delay %s %u ms\n", pci_name(dev), ms);
++	msleep(ms);
++	pr_info("pcitest: add delay %s done, device_add\n", pci_name(dev));
++}
++
++/* One-shot: no-op until its debugfs file is written */
++unsigned int pcitest_probe_delay_ms;
++
++void pcitest_probe_delay(struct pci_dev *dev);
++void pcitest_probe_delay(struct pci_dev *dev)
++{
++	unsigned int ms;
++
++	if (!READ_ONCE(pcitest_probe_delay_ms) || !pci_is_pcie(dev) ||
++	    pci_pcie_type(dev) != PCI_EXP_TYPE_ENDPOINT)
++		return;
++	ms = xchg(&pcitest_probe_delay_ms, 0);
++	if (!ms)
++		return;
++	pr_info("pcitest: probe delay %s %u ms\n", pci_name(dev), ms);
++	msleep(ms);
++	pr_info("pcitest: probe delay %s done\n", pci_name(dev));
++}
++
++static const struct file_operations hold_fops = { .write = hold_write };
++static const struct file_operations remove_locked_fops = { .write = remove_locked_write };
++static const struct file_operations rpm_allow_fops = { .write = rpm_allow_write };
++static const struct file_operations err_reset_fops = { .write = err_reset_write };
++static const struct file_operations reset_bus_fops = { .write = reset_bus_write };
++static const struct file_operations host_reset_fops = { .write = host_reset_write };
++static const struct file_operations host_reset_nolock_fops = { .write = host_reset_nolock_write };
++static const struct file_operations aer_reset_fops = { .write = aer_reset_write };
++static const struct file_operations aer_host_reset_fops = { .write = aer_host_reset_write };
++static const struct file_operations slot_reset_fops = { .write = slot_reset_write };
++static const struct file_operations slot_reset2_fops = { .write = slot_reset2_write };
++static const struct file_operations disconnect_fops = { .write = disconnect_write };
++
++static int __init pcitest_hooks_init(void)
++{
++	struct dentry *d = debugfs_create_dir("pcitest", NULL);
++	struct dentry *d2 = debugfs_create_dir("pcitest2", NULL);
++
++	debugfs_create_file("hold_rescan_ms", 0200, d, NULL, &hold_fops);
++	debugfs_create_file("host_reset", 0200, d, NULL, &host_reset_fops);
++	debugfs_create_file("host_reset_nolock", 0200, d, NULL, &host_reset_nolock_fops);
++	debugfs_create_file("slot_reset", 0200, d, NULL, &slot_reset_fops);
++	debugfs_create_file("disconnect", 0200, d, NULL, &disconnect_fops);
++	debugfs_create_file("slot_reset", 0200, d2, NULL, &slot_reset2_fops);
++	debugfs_create_file("err_reset", 0200, d, NULL, &err_reset_fops);
++	debugfs_create_file("aer_reset", 0200, d, NULL, &aer_reset_fops);
++	debugfs_create_file("aer_host_reset", 0200, d, NULL, &aer_host_reset_fops);
++	debugfs_create_file("reset_bus", 0200, d, NULL, &reset_bus_fops);
++	debugfs_create_u32("aer_link_delay_ms", 0600, d, &pcitest_aer_link_delay_ms);
++	debugfs_create_file("remove_locked", 0200, d, NULL, &remove_locked_fops);
++	debugfs_create_file("rpm_allow", 0200, d, NULL, &rpm_allow_fops);
++#if IS_BUILTIN(CONFIG_PCI_HOST_COMMON)
++	debugfs_create_file("link_down", 0200, d, NULL, &link_down_fops);
++#endif
++	debugfs_create_u32("add_delay_ms", 0600, d, &pcitest_add_delay_ms);
++	debugfs_create_u32("probe_delay_ms", 0600, d, &pcitest_probe_delay_ms);
++	return 0;
++}
++late_initcall(pcitest_hooks_init);
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index d63209ec9cad..f53d0b0f597e 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -26,6 +26,8 @@
+ #include <trace/events/pci.h>
+ #include "pci.h"
+ 
++void pcitest_add_delay(struct pci_dev *dev);	/* TEST ONLY (pciehp-reset-lab) */
++
+ static struct resource busn_resource = {
+ 	.name	= "PCI busn",
+ 	.start	= 0,
+@@ -2771,6 +2773,7 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
+ 	down_write(&pci_bus_sem);
+ 	list_add_tail(&dev->bus_list, &bus->devices);
+ 	up_write(&pci_bus_sem);
++	pcitest_add_delay(dev);	/* TEST ONLY (pciehp-reset-lab) */
+ 
+ 	ret = pcibios_device_add(dev);
+ 	WARN_ON(ret < 0);

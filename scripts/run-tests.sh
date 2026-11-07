@@ -8,73 +8,93 @@ logs="${root}/out/logs"
 
 usage()
 {
-	echo "usage: $0 [--jobs N] [--runs N] [--dry-run] [all|<kernel>|<test>|<kernel>:<test>]" >&2
-	echo "  kernels: mainline fixed mainline-kasan fixed-kasan mainline-hooks fixed-hooks" >&2
-	echo "           mainline-hooks-kasan fixed-hooks-kasan" >&2
-	echo "  tests: ${TEST_NAMES}" >&2
+	cat >&2 <<EOF
+usage: $0 [--suite bugs|fixes] [--tree TREE]... [--jobs N] [--runs N] [--all-runs] [--dry-run] [SELECTION]
+  --suite bugs   (default) every test on v7.4-rc1, expecting its bug's symptom
+  --suite fixes  every test plus the fix tracking tests on each --tree (default:
+                 the trees of configs/fix-trees.conf), expecting "clean"
+  --runs N       runs per entry (default: the test's runs or fixruns)
+  --all-runs     bug suite: do every run instead of stopping at the first one
+                 that shows the symptom, to measure its rate
+  SELECTION      all (default), a test, an issue ID (e.g. N11), a kernel, or
+                 KERNEL:TEST
+  tests: ${TEST_NAMES}
+EOF
 	exit 2
 }
 
-# Tests: "name scenario var rounds".  "-" leaves the scenario's default.
+# Tests: "name issues flavor scenario var rounds expectation runs fixruns".
+#   flavor   kernel build: plain (v7.4-rc1 as is), kasan, hooks (with
+#            patches/test-hooks.patch), hooks-kasan, hooks-hc (hooks plus
+#            configs/hc.config: pci-host-common built in)
+#   scenario guest/scn/<scenario>.sh; var and rounds ("-": the default of
+#            harness/run.py) are passed to it as var= and a=
+#   expectation  the symptom the test shows on v7.4-rc1: hang, lockdep,
+#            kasan, warn or fail (harness/check.py)
+#   runs     bug suite: attempts until the symptom shows up
+#   fixruns  fix tracking: runs that all have to be clean
 TESTS=(
-	"vfio-exit-deadlock deadlock exit -"
-	"vfio-reset-deadlock deadlock ioctl -"
-	"sysfs-remove-deadlock sysfsrm del -"
-	"sriov-disable-deadlock sriovdl - -"
-	"hotadd-lockdep plain - -"
-	"reset-storm storm - -"
-	"slot-mutex-lockdep slotmx - -"
-	"reset-during-bind bindreset - -"
-	"nested-lockdep nestlock - -"
-	"nested-removal nested - -"
-	"sysfs-remove-uaf sysremove e1000e 10"
-	"pciehp-unbind-uaf svcunbind fn 20"
-	"host-reset-deadlock hostreset - -"
-	"reset-removal-uaf teardown err 20"
-	"reset-adding-device addwin win -"
-	"reset-pciehp-unbind lifetime - -"
-	"reset-before-bind window2 hold -"
-	"reset-after-scan scanwin post -"
-	"aer-hotadd-race single aer 5"
-	"sriov-remove-abba sriovabba sysfs -"
+	# P0: the production deadlock and its variants
+	"vfio-exit-deadlock P0 plain deadlock exit - hang 1 1"
+	"vfio-reset-deadlock P0 plain deadlock ioctl - hang 1 1"
+	"sysfs-remove-deadlock P0 plain sysfsrm del - hang 1 1"
+	"sriov-disable-deadlock P0 plain sriovdl - - hang 1 1"
+	"hotadd-lockdep N1 plain plain - - lockdep 1 1"
+	"nested-lockdep N1 plain nestlock - - lockdep 1 1"
+	"host-reset-deadlock N2 hooks hostreset - - hang 1 1"
+	# N3: spurious-link-lookup-deadlock (in progress)
+	"reset-removal-uaf N4 hooks-kasan teardown err 20 kasan 12 2"
+	"reset-adding-device N5 hooks addwin win - hang 1 1"
+	"pciehp-unbind-uaf N6 kasan svcunbind fn 20 kasan 1 1"
+	"reset-pciehp-unbind N6,N8 hooks lifetime - - hang 1 1"
+	"reset-before-bind N7 hooks window2 hold - fail 1 1"
+	"reset-after-scan N7 hooks scanwin post - fail 4 2"
+	"reset-storm N8 plain storm - - hang 1 1"
+	"reset-during-bind N8 plain bindreset - - hang 1 1"
+	"slot-mutex-lockdep N8 plain slotmx - - lockdep 1 1"
+	"aer-hotadd-race N8,N12 hooks single aer 5 hang 1 1"
+	"sysfs-remove-uaf N9 kasan sysremove e1000e 10 kasan 1 1"
+	"nested-removal N10 plain nested - - hang 6 3"
+	"nested-bringup-deadlock N10 hooks nestbringup sysfs - hang 2 2"
+	"port-unbind-deadlock N10 hooks portunbind lockedadd - hang 2 2"
+	"port-unbind-host-reset N10 hooks portunbind hostlock - hang 2 2"
+	"sriov-recovery-walk-deadlock N11 hooks sriovreset walk 60 hang 2 3"
+	"recovery-walk-deadlock N11 hooks portunbind nolock - hang 2 2"
+	"recovery-hotadd-msix N12 hooks aermsix - - warn 2 3"
+	"sriov-remove-abba N13 hooks sriovabba sysfs - hang 1 2"
+	"sriov-pciehp-abba N13 hooks sriovabba pciehp - hang 2 6"
+	# N14: dead-link-reset-wait (in progress)
+	"reset-holds-removing N15 hooks resetremove - - hang 2 3"
+	"reset-holds-probing N16 hooks resetprobe rescan 10 hang 2 3"
+	"reset-subordinate-uaf N17 kasan subuaf 4 20 kasan 2 3"
+	"pciehp-rpm-recursion N18 hooks rpmrec remove+pin - hang 2 3"
+	"rescan-remove-deadlock N19 plain rescanrm race-dev 10 hang 2 3"
+	"sriov-host-reset-deadlock N20 hooks sriovreset hostreset - hang 1 2"
+	"sriov-linkdown-deadlock N20 hooks-hc sriovreset linkdown 60 hang 2 3"
+	# N21: pf-unbind-unlocked-vf-removal (in progress)
+	"removal-stall N22 plain vfstall pciehp - fail 1 2"
+	"bind-during-removal N23 plain bindremove sysfs - fail 1 2"
+	# N24: shutdown-aer-deadlock (in progress)
 )
-TEST_NAMES="$(for t in "${TESTS[@]}"; do echo -n "${t%% *} "; done)"
-
-# Matrix: "kernel test expectation runs".  An expectation other than "clean"
-# is met if any of the runs shows it; "clean" needs every run to be clean.
-MATRIX=(
-	# Tier 1: exact mainline and fix series, no test code in the kernel.
-	"mainline vfio-exit-deadlock hang 1"		"fixed vfio-exit-deadlock clean 1"
-	"mainline vfio-reset-deadlock hang 1"		"fixed vfio-reset-deadlock clean 1"
-	"mainline sysfs-remove-deadlock hang 1"		"fixed sysfs-remove-deadlock clean 1"
-	"mainline sriov-disable-deadlock hang 1"	"fixed sriov-disable-deadlock clean 1"
-	"mainline hotadd-lockdep lockdep 1"		"fixed hotadd-lockdep clean 1"
-	"mainline reset-storm hang 1"			"fixed reset-storm clean 1"
-	"mainline slot-mutex-lockdep lockdep 1"		"fixed slot-mutex-lockdep clean 1"
-	"mainline reset-during-bind hang 1"		"fixed reset-during-bind clean 1"
-	"mainline nested-lockdep lockdep 1"		"fixed nested-lockdep clean 1"
-	"mainline nested-removal hang 4"		"fixed nested-removal clean 2"
-	"mainline-kasan sysfs-remove-uaf kasan 1"	"fixed-kasan sysfs-remove-uaf clean 1"
-	"mainline-kasan pciehp-unbind-uaf kasan 1"	"fixed-kasan pciehp-unbind-uaf clean 1"
-	# Tier 2: the same trees plus the TEST ONLY hooks and delay knobs.
-	"mainline-hooks host-reset-deadlock hang 1"	"fixed-hooks host-reset-deadlock clean 1"
-	"mainline-hooks-kasan reset-removal-uaf kasan 6" "fixed-hooks-kasan reset-removal-uaf clean 2"
-	"mainline-hooks reset-adding-device hang 1"	"fixed-hooks reset-adding-device clean 1"
-	"mainline-hooks reset-pciehp-unbind hang 1"	"fixed-hooks reset-pciehp-unbind clean 1"
-	"mainline-hooks reset-before-bind fail 1"	"fixed-hooks reset-before-bind clean 1"
-	"mainline-hooks reset-after-scan fail 4"	"fixed-hooks reset-after-scan clean 1"
-	# Known issues that the fix series doesn't address.
-	"mainline-hooks aer-hotadd-race hang 1"		"fixed-hooks aer-hotadd-race fail 1"
-	"mainline-hooks sriov-remove-abba hang 1"	"fixed-hooks sriov-remove-abba hang 1"
+# Fix tracking only: regressions that fix attempts introduced, not bugs of
+# v7.4-rc1.  "name - flavor scenario var rounds - - fixruns"
+FIXTESTS=(
+	"pciehp-rpm-safe-removal - hooks rpmsafe rpm - - - 3"
+	"linkdown-hotadd-bars - hooks-hc linkdownadd - - - - 3"
+	"pf-probe-sriov-removal - hooks pfprobe - - - - 2"
 )
+TEST_NAMES="$(for t in "${TESTS[@]}" "${FIXTESTS[@]}"; do echo -n "${t%% *} "; done)"
 
-jobs=1 runs_override="" dry_run=0
+suite=bugs jobs=1 runs_override="" dry_run=0 all_runs=0 trees=()
 while [ $# -gt 0 ]; do
 	case "$1" in
+	--suite) [ $# -ge 2 ] || usage; suite="$2"; shift 2 ;;
+	--tree) [ $# -ge 2 ] || usage; trees+=("$2"); shift 2 ;;
 	--jobs|-j) [ $# -ge 2 ] || usage; jobs="$2"; shift 2 ;;
 	--jobs=*) jobs="${1#--jobs=}"; shift ;;
 	--runs) [ $# -ge 2 ] || usage; runs_override="$2"; shift 2 ;;
 	--dry-run) dry_run=1; shift ;;
+	--all-runs) all_runs=1; shift ;;
 	-h|--help) usage ;;
 	-*) usage ;;
 	*) break ;;
@@ -82,42 +102,73 @@ while [ $# -gt 0 ]; do
 done
 [ $# -le 1 ] || usage
 selection="${1:-all}"
+case "${suite}" in bugs|fixes) ;; *) usage ;; esac
+if [ "${suite}" = fixes ] && [ ${#trees[@]} -eq 0 ]; then
+	mapfile -t trees < <("${root}/scripts/build.sh" list-trees)
+fi
 
-test_def() # name -> "scenario var rounds"
+# kernel_for SUITE TREE FLAVOR
+kernel_for()
 {
-	local t
-	for t in "${TESTS[@]}"; do
-		if [ "${t%% *}" = "$1" ]; then
-			echo "${t#* }"
-			return 0
-		fi
-	done
-	return 1
+	if [ "$1" = bugs ]; then
+		case "$3" in
+		plain) echo mainline ;;
+		kasan) echo mainline-kasan ;;
+		*) echo "mainline-$3" ;;
+		esac
+	else
+		case "$3" in
+		plain) echo "$2-hooks" ;;
+		kasan) echo "$2-hooks-kasan" ;;
+		*) echo "$2-$3" ;;
+		esac
+	fi
 }
 
-selected() # kernel test
+selected() # kernel test issues
 {
 	case "${selection}" in
 	all) return 0 ;;
 	"$1:$2"|"$1"|"$2") return 0 ;;
 	esac
+	case ",$3," in *",${selection},"*) return 0 ;; esac
 	return 1
 }
 
+# Entries: "kernel test scenario var rounds expectation runs"
 entries=()
-for e in "${MATRIX[@]}"; do
-	read -r kernel test expect runs <<< "${e}"
-	if selected "${kernel}" "${test}"; then
-		entries+=("${kernel} ${test} ${expect} ${runs_override:-${runs}}")
-	fi
-done
+add_entries() # suite tree defs...
+{
+	local s="$1" tr="$2" t name issue flavor scn var rounds expect runs fixruns kernel
+	shift 2
+	for t in "$@"; do
+		read -r name issue flavor scn var rounds expect runs fixruns <<< "${t}"
+		kernel="$(kernel_for "${s}" "${tr}" "${flavor}")"
+		if [ "${s}" = fixes ]; then
+			expect=clean runs="${fixruns}"
+		fi
+		if selected "${kernel}" "${name}" "${issue}"; then
+			entries+=("${kernel} ${name} ${scn} ${var} ${rounds} ${expect} ${runs_override:-${runs}}")
+		fi
+	done
+}
+if [ "${suite}" = bugs ]; then
+	add_entries bugs - "${TESTS[@]}"
+else
+	for tr in "${trees[@]}"; do
+		add_entries fixes "${tr}" "${TESTS[@]}" "${FIXTESTS[@]}"
+	done
+fi
 if [ ${#entries[@]} -eq 0 ]; then
-	echo "no matrix entry matches '${selection}'" >&2
+	echo "no test matches '${selection}'" >&2
 	usage
 fi
 
 if [ "${dry_run}" -eq 1 ]; then
-	printf '%s\n' "${entries[@]}"
+	for e in "${entries[@]}"; do
+		read -r kernel test scn var rounds expect runs <<< "${e}"
+		echo "${kernel} ${test} ${expect} ${runs}"
+	done
 	exit 0
 fi
 
@@ -130,13 +181,12 @@ for path in "${root}/out/initramfs.cpio.gz"; do
 done
 mkdir -p "${logs}"
 
-run_entry() # kernel test expect runs
+run_entry() # kernel test scenario var rounds expect runs
 {
-	local kernel="$1" test="$2" expect="$3" runs="$4"
+	local kernel="$1" test="$2" scn="$3" var="$4" rounds="$5" expect="$6" runs="$7"
 	local image="${root}/out/linux-${kernel}/arch/x86/boot/bzImage"
-	local scn var rounds dir i met=0 bad=0 line args=()
+	local dir i n=0 met=0 bad=0 hits=0 line args=()
 
-	read -r scn var rounds <<< "$(test_def "${test}")"
 	[ "${var}" = - ] || args+=(--var "${var}")
 	[ "${rounds}" = - ] || args+=(--a "${rounds}")
 	case "${kernel}" in *-kasan) args+=(--kasan) ;; esac
@@ -151,32 +201,35 @@ run_entry() # kernel test expect runs
 		mkdir -p "${dir%/*}"
 		python3 "${root}/harness/run.py" "${image}" "${scn}" "${dir}" "${args[@]}" \
 			--label "${test}" > "${dir}.out" 2>&1 || true
+		n=$((n + 1))
 		if line="$(python3 "${root}/harness/check.py" "${dir}/result.json" "${expect}" 2>&1)"; then
-			met=1
+			met=1 hits=$((hits + 1))
 		else
 			bad=1
 		fi
 		echo "    run ${i}: ${line}; log: ${dir}/serial.log"
-		# A symptom shows up once: stop.  A clean expectation runs them all.
-		if [ "${expect}" != clean ] && [ "${met}" = 1 ]; then
+		# A symptom shows up once: stop, unless measuring its rate.  A
+		# clean expectation runs them all.
+		if [ "${expect}" != clean ] && [ "${met}" = 1 ] && [ "${all_runs}" = 0 ]; then
 			break
 		fi
 	done
 	if { [ "${expect}" = clean ] && [ "${bad}" = 0 ]; } ||
 	   { [ "${expect}" != clean ] && [ "${met}" = 1 ]; }; then
-		echo "PASS: ${kernel}:${test} (expected ${expect})"
+		echo "PASS: ${kernel}:${test} (expected ${expect}; met in ${hits}/${n} runs)"
 		return 0
 	fi
-	echo "FAIL: ${kernel}:${test} (expected ${expect})"
+	echo "FAIL: ${kernel}:${test} (expected ${expect}; met in ${hits}/${n} runs)"
 	return 1
 }
 
-results="${logs}/results.txt"
+results="${logs}/results-${suite}.txt"
 : > "${results}"
 running=0
 for e in "${entries[@]}"; do
-	read -r kernel test expect runs <<< "${e}"
-	(run_entry "${kernel}" "${test}" "${expect}" "${runs}" > "${logs}/${kernel}-${test}.txt" 2>&1 || true
+	read -r kernel test scn var rounds expect runs <<< "${e}"
+	(run_entry "${kernel}" "${test}" "${scn}" "${var}" "${rounds}" "${expect}" "${runs}" \
+		> "${logs}/${kernel}-${test}.txt" 2>&1 || true
 	 cat "${logs}/${kernel}-${test}.txt"; grep -E '^(PASS|FAIL):' "${logs}/${kernel}-${test}.txt" >> "${results}") &
 	running=$((running + 1))
 	if [ "${running}" -ge "${jobs}" ]; then

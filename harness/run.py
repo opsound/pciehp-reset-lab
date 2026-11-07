@@ -8,16 +8,18 @@
 # Usage: run.py <bzImage> <scenario> <outdir> [--var V] [--n N] [--a A]
 #               [--timeout S] [--kasan] [--qemu PATH] [--initrd F]
 # Per-scenario defaults (SCN below) supply var, n, timeout, kernel arguments and
-# topology.
+# topology, per variant where by_var says so.
 #
 # Topology: rp1..rpN pcie-root-ports (N = max(n, 2), chassis/slot i, rp1 at
-# 00:10.0, rp2 at 00:11.0, ...), optionally a root port at 00:1e.0 with an
-# x3130 switch (up1) and two hotplug downstream ports dp1/dp2 carrying e1000e
-# nicd1/nicd2.  Hot-added devices come from the guest's @@ACT requests (e1000e
-# by default, igb for SR-IOV).  The guest sends @@ACT lines on ttyS1
+# 00:10.0, rp2 at 00:11.0, ...), optionally a root port rps at 00:1e.0 with an
+# x3130 switch (up1) and two hotplug downstream ports dp1/dp2 carrying the
+# devices of nestdevs ("DEV1,DEV2": "-" for an empty slot, drivers joined by
+# "+" for the functions of a multifunction device; default e1000e nicd1/nicd2),
+# plus qemu_extra devices.  Hot-added devices come from the guest's @@ACT
+# requests (e1000e by default, igb for SR-IOV).  The guest sends @@ACT lines on ttyS1
 # (guest.log), which only it writes to, so kernel messages on ttyS0 can't
 # corrupt them; only complete lines are executed.
-import argparse, json, os, re, socket, subprocess, sys, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -26,7 +28,14 @@ import qxparse  # noqa: E402
 
 # Per-scenario defaults.  n: root ports (and the scenario's n=), var: default
 # variant, a: rounds/seconds, timeout: host-side limit in s, nested: switch
-# topology, append: extra kernel args, lockdep_check: a lockdep report fails the run.
+# topology, nestdevs: devices below the switch, rpsopts: extra properties of
+# the switch's root port, rpopts: extra properties of rp1..rpN, qemu_extra:
+# more -device arguments, append: extra kernel args, lockdep_check: a lockdep
+# report fails the run, by_var: per-variant overrides.
+PCP_OFF = "power_controller_present=off"
+# A Root Port without a hotplug slot, with an igb PF present at boot.
+RPC_IGB = ["-device", "pcie-root-port,id=rpc,bus=pcie.0,chassis=50,slot=50,addr=0x1d,hotplug=off",
+           "-device", "igb,id=pf1,bus=rpc"]
 SCN = {
     "deadlock": dict(var="exit", timeout=150),
     "sysfsrm": dict(var="del", timeout=150),
@@ -47,11 +56,30 @@ SCN = {
     "scanwin": dict(var="post", timeout=150),
     "single": dict(var="aer", a="5", timeout=400),
     "sriovabba": dict(var="sysfs", timeout=150),
+    "portunbind": dict(nested=True, var="lockedadd", timeout=200,
+                       by_var={"lockedadd": dict(nestdevs="-,e1000e")}),
+    "nestbringup": dict(nested=True, nestdevs="-,e1000e", var="sysfs", timeout=200),
+    "sriovreset": dict(var="hostreset", a="60", timeout=400, by_var={"walk": dict(qemu_extra=RPC_IGB)}),
+    "resetremove": dict(nested=True, nestdevs="e1000e,igb", timeout=200),
+    "resetprobe": dict(nested=True, nestdevs="-,igb", var="pciehp", timeout=150,
+                       by_var={"rescan": dict(nestdevs="e1000e,igb", rpsopts="hotplug=off")}),
+    "subuaf": dict(nested=True, nestdevs="e1000e,-", var="1", a="20", timeout=400),
+    # A NIC present at boot on rp1, so that bridge_d3 gets set without a pciehp hot-add
+    "rpmrec": dict(var="remove+pin", append="pcie_port_pm=force", timeout=200, lockdep_check=True,
+                   qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"]),
+    "rescanrm": dict(nested=True, var="race-dev", a="10", timeout=300),
+    "vfstall": dict(var="pciehp", timeout=200),
+    "bindremove": dict(nested=True, var="sysfs", timeout=200),
+    "aermsix": dict(timeout=150),
+    "rpmsafe": dict(var="rpm", rpopts=PCP_OFF, append="pcie_port_pm=force", timeout=120),
+    "linkdownadd": dict(timeout=120),
+    "pfprobe": dict(append="igb.max_vfs=2", timeout=150),
 }
 
 
 def defaults(scn, var):
-    d = dict(n=2, var="x", a="", timeout=200, nested=False, rpopts="", append="", loglevel=7, lockdep_check=False)
+    d = dict(n=2, var="x", a="", timeout=200, nested=False, nestdevs="e1000e,e1000e", rpsopts="", rpopts="",
+             qemu_extra=[], append="", loglevel=7, lockdep_check=False)
     d.update({k: v for k, v in SCN.get(scn, {}).items() if k != "by_var"})
     v = var if var is not None else d["var"]
     d.update(SCN.get(scn, {}).get("by_var", {}).get(v, {}))
@@ -88,8 +116,12 @@ def main():
         timeout *= 2   # KASAN guests run 2-3x slower
 
     os.makedirs(a.out, exist_ok=True)
-    log, act, qmp = (os.path.join(a.out, f) for f in ("serial.log", "guest.log", "qmp.sock"))
-    for f in (log, act, qmp, os.path.join(a.out, "result.json")):
+    log, act = (os.path.join(a.out, f) for f in ("serial.log", "guest.log"))
+    # AF_UNIX socket paths are limited to 108 bytes, so the QMP socket lives in
+    # a short private directory rather than in the output directory.
+    a.qdir = tempfile.mkdtemp(prefix="pciehp-lab-")
+    qmp = os.path.join(a.qdir, "qmp.sock")
+    for f in (log, act, os.path.join(a.out, "result.json")):
         if os.path.exists(f):
             os.unlink(f)
     nrp = max(n, 2)
@@ -105,12 +137,21 @@ def main():
             sys.exit("rp%d would collide with the switch's root port at 00:1e.0" % i)
         cmd += ["-device", "pcie-root-port,id=rp%d,bus=pcie.0,chassis=%d,slot=%d,addr=0x%x%s"
                 % (i, i, i, addr, ("," + rpopts) if rpopts else "")]
+    cmd += list(d["qemu_extra"])
     if nested:
-        cmd += ["-device", "pcie-root-port,id=rps,bus=pcie.0,chassis=40,slot=40,addr=0x1e",
+        cmd += ["-device", "pcie-root-port,id=rps,bus=pcie.0,chassis=40,slot=40,addr=0x1e%s"
+                % (("," + d["rpsopts"]) if d["rpsopts"] else ""),
                 "-device", "x3130-upstream,id=up1,bus=rps",
                 "-device", "xio3130-downstream,id=dp1,bus=up1,chassis=41,slot=1",
-                "-device", "xio3130-downstream,id=dp2,bus=up1,chassis=42,slot=2",
-                "-device", "e1000e,id=nicd1,bus=dp1", "-device", "e1000e,id=nicd2,bus=dp2"]
+                "-device", "xio3130-downstream,id=dp2,bus=up1,chassis=42,slot=2"]
+        for i, spec in enumerate(d["nestdevs"].split(","), 1):
+            fns = [] if spec in ("", "-") else spec.split("+")
+            for fn, drv in enumerate(fns):
+                if len(fns) == 1:
+                    cmd += ["-device", "%s,id=nicd%d,bus=dp%d" % (drv, i, i)]
+                else:
+                    cmd += ["-device", "%s,id=nicd%d%s,bus=dp%d,addr=0.%d%s" % (
+                        drv, i, "f%d" % fn if fn else "", i, fn, ",multifunction=on" if fn == 0 else "")]
     av = a.a if a.a is not None else d["a"]
     cmdline = "console=ttyS0 intel_iommu=on panic=-1 loglevel=%d log_buf_len=8M printk.devkmsg=on scn=%s var=%s n=%d%s %s" % (
         loglevel, a.scn, d["var"], n, (" a=%s" % av) if av else "", append)
@@ -211,6 +252,7 @@ def finish(a, d, n, kernel, binfo, q, stamp, timed_out, nact):
     if q.poll() is None:
         q.kill(); q.wait()
         stamp("killed qemu")
+    shutil.rmtree(a.qdir, ignore_errors=True)
     rd = lambda f: open(os.path.join(a.out, f), errors="replace").read() if os.path.exists(os.path.join(a.out, f)) else ""
     txt, gtxt = rd("serial.log"), rd("guest.log")
     rec = qxparse.parse(txt, gtxt)
