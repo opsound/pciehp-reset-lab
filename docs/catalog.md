@@ -867,11 +867,12 @@ reports. All of them are present in v7.4-rc1. Earlier versions of this catalog c
   (v6.13-rc1) for the sysfs path; 8238cb69c01f (v7.1-rc1) routed it through pci_reset_bridge().
   pci_bus_error_reset() (AER, pci_host_reset_root_port()) uses bridge->subordinate the same way.
 - Impact: use-after-free of struct pci_bus; GPF without KASAN.
-- Lab: `reset-subordinate-uaf` (exact mainline, KASAN: a loop writing a switch Downstream Port's
+- Lab: `reset-subordinate-uaf` (exact mainline, KASAN: four loops writing a switch Downstream Port's
   reset_subordinate while the switch's Upstream Port is removed through sysfs): "KASAN:
-  slab-use-after-free in pci_bus_restore_locked" <- pci_try_reset_bus <- reset_subordinate_store, freed
-  by remove_store -> pci_remove_bus_device, in the first round of every run (18 of 18 runs of three
-  variants on v7.4-rc1). With slub_debug=P instead of KASAN: GPF at 0x6b6b6b6b6b6b6beb.
+  slab-use-after-free in pci_reset_bridge" <- reset_subordinate_store, on a struct pci_bus freed by
+  remove_store -> pci_remove_bus_device, in the first round of every run; with a single loop the report
+  is in pci_bus_restore_locked() <- pci_try_reset_bus(). 18 of 18 runs of three variants on v7.4-rc1
+  reported it. With slub_debug=P instead of KASAN: GPF at 0x6b6b6b6b6b6b6beb.
 - Earlier reports: no earlier report found. Related: E21 (same entry point, a freed pci_dev; N4).
 
 ### N18. Recursive read of reset_lock when pciehp's IRQ thread runtime-resumes its port
