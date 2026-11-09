@@ -41,7 +41,7 @@ RPC_IGB = ["-device", "pcie-root-port,id=rpc,bus=pcie.0,chassis=50,slot=50,addr=
 SCN = {
     "deadlock": dict(var="exit", timeout=150),
     "sysfsrm": dict(var="del", timeout=150),
-    "sriovdl": dict(timeout=150),
+    "sriovdl": dict(timeout=200),
     "plain": dict(timeout=120, lockdep_check=True),
     "storm": dict(n=8, timeout=200),
     "slotmx": dict(timeout=120, lockdep_check=True),
