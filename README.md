@@ -264,7 +264,7 @@ The regression tests:
 
 | test | tier | guards against | what it does |
 |---|---|---|---|
-| `pciehp-rpm-safe-removal` | 2 | a fix for N18 that re-enumerates a safely removed card on runtime resume | safe removal (sysfs power=0) of a card in a slot without a power controller while its Root Port is runtime-suspended; the slot must stay off |
+| `pciehp-rpm-safe-removal` | 2 | a fix for N18 that re-enumerates a safely removed card on runtime resume | safe removal (sysfs power=0) of a card, present at boot in a slot without a power controller, while its Root Port is runtime-suspended; the slot must stay off |
 | `linkdown-hotadd-bars` | 2, hc | a fix for N2 or N20 that lets pciehp bind a device between the recovery's error_detected walk and its reset (N12) | a NIC hot-added while the real link-down recovery of its Root Port runs; it must end up bound with its BARs |
 | `pf-probe-sriov-removal` | 2 | a fix that takes pci_rescan_remove_lock while adding VFs and so deadlocks at probe time | a PF driver that enables SR-IOV in `->probe()` (igb max_vfs) is bound while a remover that holds pci_rescan_remove_lock waits for the PF |
 

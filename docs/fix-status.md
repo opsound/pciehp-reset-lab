@@ -274,9 +274,9 @@ Tests not in the lab are described, not named.
 ## Fix-tracking-only regression tests
 
 Not part of the bug suite: they check fix attempts for regressions, not mainline bugs.
-- `pciehp-rpm-safe-removal`: safe removal (sysfs power=0) of a card in a slot without a power
-  controller while its Root Port is runtime-suspended (pcie_port_pm=force); the slot must stay off, so
-  a fix for N18 must not re-enumerate the card on runtime resume.
+- `pciehp-rpm-safe-removal`: safe removal (sysfs power=0) of a card, present at boot in a slot without
+  a power controller, while its Root Port is runtime-suspended (pcie_port_pm=force); the slot must stay
+  off, so a fix for N18 must not re-enumerate the card on runtime resume.
 - `linkdown-hotadd-bars`: a NIC hot-added while the real pci-host-common link-down recovery of its Root
   Port runs (CONFIG_OF and CONFIG_PCI_HOST_GENERIC); the NIC must end up bound with its BARs, so a fix
   for N2 or N20 must not let pciehp bind it between the recovery's error_detected walk and its reset

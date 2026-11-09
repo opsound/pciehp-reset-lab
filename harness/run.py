@@ -118,7 +118,9 @@ SCN = {
                    by_var={"vanish-aspm": dict(append=""),
                            "resume": dict(rpopts=PCP_OFF, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1,addr=0.1"]),
                            "boot-aspm": dict(append="", rpopts=PCP_OFF, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1,addr=0.1"])}),
-    "rpmsafe": dict(var="rpm", rpopts=PCP_OFF, append="pcie_port_pm=force", timeout=120),
+    # nic2 present at boot, in a slot without power controller
+    "rpmsafe": dict(var="rpm", rpopts=PCP_OFF, append="pcie_port_pm=force", timeout=120,
+                    qemu_extra=["-device", "e1000e,id=nic2,bus=rp2"]),
     "linkdownadd": dict(timeout=120),
     "pfprobe": dict(append="igb.max_vfs=2", timeout=150),
     # B = e1000e on rp1, removed through sysfs: the pci_bus_sem writer
