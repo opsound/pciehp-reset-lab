@@ -1,18 +1,19 @@
 # Reference fix series: status
 
-Status as of 2026-11-06. Issue IDs and test names are those of [catalog.md](catalog.md).
+Status as of 2026-11-09. Issue IDs and test names are those of [catalog.md](catalog.md).
 
 The reference fix series is 12 commits on v7.4-rc1 (6628e7d4c6b2), branch `pciehp-reset-fixes` of
 https://github.com/opsound/linux. It was written and validated with LLM assistance and is provided for
 reference only; see the README. Each commit message describes its bug, the fix and how it was tested.
 Fix tracking (`./run fixes`) builds it with the TEST ONLY hooks patch
-`patches/test-hooks-pciehp-reset-fixes.patch` as `pciehp-reset-fixes-hooks`, `-hooks-kasan` and
-`-hooks-hc`, and runs every test of the bug suite plus the fix tracking regression tests on it,
-expecting clean runs.
+`patches/test-hooks-pciehp-reset-fixes.patch` as `pciehp-reset-fixes-hooks`, `-hooks-kasan`,
+`-hooks-hc` and `-hooks-jh`, and runs every test of the bug suite plus the fix tracking regression
+tests on it, expecting clean runs.
 
-Summary: the series fixes P0, N1, N2, N4-N9 and the original N10 deadlock. It does not fix N3 (the
-test still deadlocks, through N11), the N10 variants or N11-N24; commits 9 and 12 address parts of
-N17 and N23 that the tests don't exercise.
+Summary: the series fixes P0, N1, N2, N4-N9, the original N10 deadlock and its surprise-removal
+case, and the hot-add half of N27. It does not fix N3 (the test still deadlocks, through N11), the
+other N10 variants, N11-N26 or the resume half of N27; commits 9 and 12 address parts of N17 and N23
+that the tests don't exercise.
 
 ## Commits
 
@@ -36,12 +37,18 @@ N17 and N23 that the tests don't exercise.
 `TEST_JOBS=8 ./run fixes` in a fresh clone on 2026-11-06: 19 of 43 entries clean. "clean (n/n)": every
 run was clean; otherwise the symptoms and the number of runs that showed them. An earlier run in the
 development tree gave the same results, except for the counts of the racy `sriov-pciehp-abba` (3/6)
-and `reset-holds-removing` (2/3).
+and `reset-holds-removing` (2/3). The eight tests added on 2026-11-09 (`vfio-exit-surprise`,
+`vfio-reset-surprise`, `bus-reset-removal-uaf`, `nested-surprise-removal`, `reset-prepare-order`,
+`isolated-fn-aspm-oops`, `isolated-fn-resume-removal`, `hotadd-fn0-vanish`) and the changed
+`sriov-disable-deadlock` were run on the series in a fresh clone that day, with the hooks patch
+that adds their knobs: 5 of the 8 are clean, so 24 of 51 entries.
 
 | test | issue | result on the series |
 |---|---|---|
 | `vfio-exit-deadlock` | P0 | clean (1/1) |
 | `vfio-reset-deadlock` | P0 | clean (1/1) |
+| `vfio-exit-surprise` | P0 | clean (1/1) |
+| `vfio-reset-surprise` | P0 | clean (1/1) |
 | `sysfs-remove-deadlock` | P0 | clean (1/1) |
 | `sriov-disable-deadlock` | P0 | clean (1/1) |
 | `hotadd-lockdep` | N1 | clean (1/1) |
@@ -49,6 +56,7 @@ and `reset-holds-removing` (2/3).
 | `host-reset-deadlock` | N2 | clean (1/1) |
 | `spurious-link-lookup-deadlock` | N3 | hang in 2/2, through N11: the resetter holds reset_lock and the device locks and waits for pci_bus_sem in pci_bridge_wait_for_secondary_bus() |
 | `reset-removal-uaf` | N4 | clean (2/2) |
+| `bus-reset-removal-uaf` | N4 | clean (4/4) |
 | `reset-adding-device` | N5 | clean (1/1) |
 | `pciehp-unbind-uaf` | N6 | clean (1/1) |
 | `reset-pciehp-unbind` | N6, N8 | clean (1/1) |
@@ -60,6 +68,7 @@ and `reset-holds-removing` (2/3).
 | `aer-hotadd-race` | N8, N12 | fail, warn in 1/1: N12, the NIC bound with BAR0 lost, and e1000e's MSI-X warning |
 | `sysfs-remove-uaf` | N9 | clean (1/1) |
 | `nested-removal` | N10 | clean (3/3) |
+| `nested-surprise-removal` | N10 | clean (3/3) |
 | `nested-bringup-deadlock` | N10 | hang in 2/2 |
 | `port-unbind-deadlock` | N10 | hang in 2/2 |
 | `port-unbind-host-reset` | N10 | hang in 2/2 |
@@ -80,6 +89,10 @@ and `reset-holds-removing` (2/3).
 | `removal-stall` | N22 | fail in 2/2: the rescan waits for the vfio-pci holder |
 | `bind-during-removal` | N23 | fail in 2/2: the bind succeeds |
 | `shutdown-aer-deadlock` | N24 | hang in 2/2 |
+| `reset-prepare-order` | N25 | hang in 2/2, in virtio-blk's ->reset_prepare() |
+| `isolated-fn-aspm-oops` | N26 | oops in 2/2, in pcie_aspm_init_link_state() |
+| `isolated-fn-resume-removal` | N27 | fail in 2/2: the slot is torn down on resume |
+| `hotadd-fn0-vanish` | N27 | clean (2/2): commit 2 checks for a missing function 0 |
 | `pciehp-rpm-safe-removal` | - | lockdep in 3/3: N18's recursive locking report; the slot stays off |
 | `linkdown-hotadd-bars` | - | clean (3/3) |
 | `pf-probe-sriov-removal` | - | warn in 2/2: N21's lockdep_assert_held() when the PF's VFs are removed; no hang |
@@ -91,17 +104,17 @@ tracking run above.
 
 | ID | issue | commits | lab tests | status |
 |---|---|---|---|---|
-| P0 | pciehp reset_lock vs vfio close-time reset | 1 (3 for lockdep) | vfio-exit-deadlock, vfio-reset-deadlock, sysfs-remove-deadlock, sriov-disable-deadlock | fixed |
+| P0 | pciehp reset_lock vs vfio close-time reset | 1 (3 for lockdep) | vfio-exit-deadlock, vfio-reset-deadlock, vfio-exit-surprise, vfio-reset-surprise, sysfs-remove-deadlock, sriov-disable-deadlock | fixed |
 | N1 | reset_lock re-acquired with pci_rescan_remove_lock held | 2, 1, 3 | hotadd-lockdep, nested-lockdep | fixed |
 | N2 | pci_host_reset_root_port() vs pciehp | 3, 1 | host-reset-deadlock | fixed |
 | N3 | pci_get_slot() under reset_lock | 4 (not the enumeration variant) | spurious-link-lookup-deadlock | not fixed: the test deadlocks through N11 instead |
-| N4 | reset walks vs removal | 5, 9 | reset-removal-uaf | fixed |
+| N4 | reset walks vs removal or addition | 5, 9 | reset-removal-uaf, bus-reset-removal-uaf | fixed |
 | N5 | resets lock devices not yet added | 6 | reset-adding-device | fixed |
 | N6 | ->reset_slot() vs hotplug driver unbind | 7 | pciehp-unbind-uaf, reset-pciehp-unbind | fixed |
 | N7 | queued slot reset vs driver binding | 10, 9, 3 | reset-before-bind, reset-after-scan | fixed |
 | N8 | pci_slot_mutex across slot resets | 8 | reset-storm, reset-during-bind, slot-mutex-lockdep, aer-hotadd-race, reset-pciehp-unbind | fixed (`aer-hotadd-race` then shows N12) |
 | N9 | remove_store() UAF | 11 | sysfs-remove-uaf | fixed |
-| N10 | nested ports: free_irq() vs pci_rescan_remove_lock | 12 (not the bring-up and port-unbind variants) | nested-removal, nested-bringup-deadlock, port-unbind-deadlock, port-unbind-host-reset | partly: the original case is fixed, the three variants hang |
+| N10 | nested ports: free_irq() vs pci_rescan_remove_lock | 12 (not the bring-up and port-unbind variants) | nested-removal, nested-surprise-removal, nested-bringup-deadlock, port-unbind-deadlock, port-unbind-host-reset | partly: the original case and its surprise-removal case are fixed, the three variants hang |
 | N11 | recovery walks vs pci_bus_sem | none | sriov-recovery-walk-deadlock, recovery-walk-deadlock | not addressed |
 | N12 | recovery reset vs hot-add | none | recovery-hotadd-msix, aer-hotadd-race | not addressed |
 | N13 | sriov_numvfs_store() vs PF removal | none | sriov-remove-abba, sriov-pciehp-abba | not addressed |
@@ -116,6 +129,9 @@ tracking run above.
 | N22 | removal stalls on a vfio-pci user | none | removal-stall | not addressed |
 | N23 | binding during removal | 12 (devices already stopped only) | bind-during-removal | not fixed: the test binds a device whose own removal hasn't started |
 | N24 | device_shutdown() vs AER recovery | none | shutdown-aer-deadlock | not addressed |
+| N25 | bridge disabled before the drivers below prepare | none | reset-prepare-order | not addressed |
+| N26 | isolated functions: pcie_aspm_init_link_state() without function 0 | none | isolated-fn-aspm-oops | not addressed |
+| N27 | pciehp's identity checks assume function 0 | 2 (the DSN read) | isolated-fn-resume-removal, hotadd-fn0-vanish | partly: the hot-add half is fixed, the resume teardown is not |
 
 ## Known gaps
 
@@ -171,6 +187,89 @@ From code review and the commit messages:
 - E8, E10, E20: commit 5 follows Lukas's advice in E8 to hold references rather than locks; commits 11
   and 12 rely on the idempotent pci_stop_dev()/pci_destroy_dev() from E10 1-5 (v6.13-rc1); commit 12
   adds the pci_dev_disallow_binding() helper Lukas suggested in E20.
+
+## Posted series
+
+Results of posted fixes in the lab, one per series, as of 2026-11-09. Each was applied to v7.4-rc1
+unless another base is named, built with the hooks patch (lockdep, KASAN and -hc kernels), and run on
+its targeted tests and once on the full suite, against the same base without the series. Lore links
+are https://lore.kernel.org/r/<message-id>. "n/m" counts runs that showed the symptom, base -> series.
+Tests not in the lab are described, not named.
+
+- W1, Qiang Yu, RFC "PCI: pciehp: Fix AB-BA deadlocks between reset_lock, pci_rescan_remove_lock and
+  pci_slot_mutex" (20260817-ab-ba-deadlock-v1-1-e619fd07d1fd@oss.qualcomm.com): `hotadd-lockdep`,
+  `nested-lockdep`, `reset-storm`, `reset-during-bind`, `slot-mutex-lockdep` and
+  `sriov-disable-deadlock` clean (3/3 -> 0/7); `vfio-exit-deadlock`, `vfio-reset-deadlock` and
+  `sysfs-remove-deadlock` still hang (7/7), through a new two-party cycle: the close-time
+  pci_reset_bus() waits for pci_rescan_remove_lock, held by the remover of the device being closed.
+  `removal-stall`, `bind-during-removal`, `reset-removal-uaf` and `reset-subordinate-uaf` hang instead
+  of failing or reporting KASAN.
+- W2, Benjamin Block / Ionut Nechita, v15 1-4 + v16 5/5 "PCI/IOV: Fix SR-IOV locking races and AB-BA
+  deadlocks" (cover.1790267348.git.bblock@linux.ibm.com; base v7.3-rc4): `sriov-remove-abba` 7/8 ->
+  0/8, `pf-unbind-unlocked-vf-removal` 8/8 -> 0/8, `sysfs-remove-deadlock` 4/4 -> 0/4;
+  `sriov-pciehp-abba` unchanged. New hangs: `pf-probe-sriov-removal` 0/8 -> 8/8, and a hot-add or
+  rescan of a PF that enables VFs in probe on a NUMA node, `numa-pf-probe-hotadd` and
+  `numa-pf-probe-rescan` 0/3 -> 3/3. PF unbind racing pciehp removal (pfunbind scenario, `--var race`)
+  goes from a use-after-free to an AB-BA deadlock.
+- W3, Keith Busch, RESEND "PCI: pciehp: fix concurrent sub-tree removal deadlock"
+  (20251016193049.881212-2-kbusch@meta.com): `nested-surprise-removal` 6/6 -> 0/6, on v7.4-rc1 and
+  v6.18-rc1; `nested-removal`, `nested-bringup-deadlock`, `port-unbind-deadlock` and
+  `port-unbind-host-reset` still hang. Without CONFIG_PCI the build fails (the RESEND dropped v2's
+  stub), and lockdep no longer reports pciehp's wait for pci_rescan_remove_lock.
+- W4, Zhang Hongtao, "PCI: Prevent device lock leak during bus reset"
+  (20260821021626.1874602-1-zhanghongtao35@huawei.com): `bus-reset-removal-uaf` leaks no lock (13/13
+  -> 0/16) but hits KASAN in 5/16 runs, in pci_bus_lock_fill() and pci_bus_resettable(); its `sub`
+  variant (try-reset path) still leaks (3/3), and `reset-removal-uaf` (slot path) is unchanged.
+- W5, Abhin Parekadan Jose, RFC v4 "PCI: pciehp: Report surprise removal during safe removal"
+  (20260927182017.938565-1-abhinjoses@gmail.com; base fd179f8a05be): a safe removal stuck in a
+  driver's ->remove() ends 1.1 s after the device's surprise removal (3/3; without 4/5 it stays stuck,
+  2/2); no change in the full suite. P0, N14 and N22 are unchanged, as vfio-pci does not use the hook.
+- W6, Shameer Kolothum, RFC v2 "vfio/pci: Handle PCI error recovery and report state to userspace"
+  (20260929173305.204856-1-skolothumtho@nvidia.com): not tested yet.
+- W9, Lukas Wunner, "PCI: Fix order of device disablement on reset"
+  (4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de): `reset-prepare-order`
+  11/11 -> 0/10; no change in the full suite.
+- W10, Alex Williamson, RFC "PCI/vfio-pci: Guard resets against active SR-IOV VFs"
+  (20260812045325.2733631-1-alex.williamson@nvidia.com; v7.2-rc7 and v7.4-rc1): `pf-reset-vf-wipe`
+  and `pf-reset-vf-wipe-vfio` 6/6 -> 0/6 on both bases; no change in the full suite. Its hot-reset
+  check (3/5) is not reached with igb, whose VFs share the PF's bus.
+- W11, Keith Busch, "vfio/pci: Restore standard PCI config space in .slot_reset()"
+  (20260817195110.2077698-1-kbusch@meta.com; base v7.2, with the one-argument ->slot_reset() it needs
+  to build): `vfio-recovery-restore` unchanged (6/6 BAR-LOST), `vfio-recovery-restore-switch` 6/6 ->
+  0/6, and both 0/6 together with aer_unbound 1/2; the Bus Master bit set by the user is not restored.
+- W12, Priyank Rathod, "PCI: pciehp: Fix NULL pointer dereference in pciehp_configure_device()"
+  (20261012-pcie-hotplug-nullref-v1-1-6e21c2e89ea4@google.com; v7.3-rc1 and v7.4-rc1):
+  `hotadd-fn0-vanish` 6/6 -> 0/6; `isolated-fn-resume-removal` and `isolated-fn-aspm-oops` unchanged;
+  no change in the full suite.
+- aer_unbound, Lukas Wunner, branch https://github.com/l1k/linux/commits/aer_unbound/ (not posted;
+  offered for testing in aoSCK2Sy0HeyX_la@wunner.de), 9ce840949ee9 and db16ca536fd0 on v7.4-rc1:
+  `aer-unbound`, `aer-unbound-mf` and `aer-unbound-vfs` 4/4 -> 0/4; `aer-no-handler` 0/4 -> 4/4 (with
+  1/2 alone 2/2): xhci_hcd, which has no error handlers, is reported recovered with its BARs zeroed.
+  The unbound function of `aer-unbound-mf` comes back with Bus Master set (Command 0x0107).
+  `recovery-hotadd-msix` keeps the NIC's BARs (6/6 -> 0/6 BAR-LOST) but still warns.
+- E17, Raju Rangoju, "PCI: pciehp: fix circular lock dependency b/w pci_rescan_remove_lock and
+  reset_lock" (20250619154610.902892-1-Raju.Rangoju@amd.com): `vfio-exit-deadlock`,
+  `vfio-reset-deadlock` and `sysfs-remove-deadlock` 4/4 -> 0/7, `sriov-disable-deadlock` 4/4 -> 0/21,
+  plus 2 clean KASAN runs each; `hotadd-lockdep` and `nested-lockdep` unchanged (N1); no change in the
+  rest of the full suite.
+- E18, Jinhui Guo, RESEND "vfio/pci: Skip hot reset on Link-Down"
+  (20251215123029.2746-1-guojinhui.liam@bytedance.com): `vfio-exit-surprise` and
+  `vfio-reset-surprise` unchanged (6/6); the check never runs (catalog E18). With the check moved
+  below the saved-state block (not posted), `vfio-exit-surprise` 0/6, `vfio-reset-surprise` 6/6.
+- E19, Ziming Du, "PCI: Fix AB-BA deadlock between aer_isr() and device_shutdown()"
+  (20260109095603.1088620-1-duziming2@huawei.com): `shutdown-aer-deadlock` with the bus-reset path
+  (`--var bus`) 8/8 -> 0/16; with the slot-reset path (the test's default) unchanged, 8/8. Contended
+  resets now fail with -EAGAIN (in `reset-holds-probing`, which then no longer hangs), and the bus
+  runs show e1000e's "disabling already-disabled device" WARNING (16/16).
+- Ziyou Wang, v2 "PCI/DPC: Increase recovery timeout to 60 seconds"
+  (tencent_BB887B4DB8D2131AF5026893E0FE567D6D05@qq.com): `dpcwait-slow` 3/3 -> 0/3; `dpcwait-dead`
+  0/3 -> 3/3: pciehp removes a surprise-removed device after 57.6 s instead of 1.1 s.
+  `dead-link-reset-wait` unchanged (no DPC in QEMU).
+- David Matlack, "vfio/pci: Fix power state race with SR-IOV enablement"
+  (20261029203324.1637772-1-dmatlack@google.com; base 076d7e989cb6 and v7.4-rc1): `vfio-pm-sriov-race`
+  rounds with the close-time WARNING 240/260 -> 0/860; 4 of 860 rounds still warn or fail
+  sriov_numvfs with -EIO through the final pci_restore_state() of vfio_pci_core_disable(), as do
+  unpatched kernels.
 
 ## Fix-tracking-only regression tests
 
