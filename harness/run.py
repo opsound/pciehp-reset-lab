@@ -48,6 +48,7 @@ SCN = {
     "bindreset": dict(timeout=120),
     "nestlock": dict(nested=True, timeout=150, lockdep_check=True),
     "nested": dict(nested=True, timeout=120),
+    "nestsurprise": dict(nested=True, var="prelock", timeout=200),
     "sysremove": dict(var="e1000e", a="10", timeout=600),
     "svcunbind": dict(var="fn", a="20", timeout=300),
     "hostreset": dict(timeout=120),
@@ -66,6 +67,8 @@ SCN = {
     "resetprobe": dict(nested=True, nestdevs="-,igb", var="pciehp", timeout=150,
                        by_var={"rescan": dict(nestdevs="e1000e,igb", rpsopts="hotplug=off")}),
     "subuaf": dict(nested=True, nestdevs="e1000e,-", var="1", a="20", timeout=400),
+    # The switch's Root Port without a hotplug slot: error resets are bus resets
+    "busuaf": dict(nested=True, rpsopts="hotplug=off", var="plain", a="20", timeout=400),
     # A NIC present at boot on rp1, so that bridge_d3 gets set without a pciehp hot-add
     "rpmrec": dict(var="remove+pin", append="pcie_port_pm=force", timeout=200, lockdep_check=True,
                    qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"]),
