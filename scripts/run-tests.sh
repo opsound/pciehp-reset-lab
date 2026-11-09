@@ -59,7 +59,7 @@ TESTS=(
 	"reset-during-bind N8 plain bindreset - - hang 1 1"
 	"slot-mutex-lockdep N8 plain slotmx - - lockdep 1 1"
 	"aer-hotadd-race N8,N12 hooks single aer 5 hang 1 1"
-	"sysfs-remove-uaf N9 kasan sysremove e1000e 10 kasan 1 1"
+	"sysfs-remove-uaf N9 kasan sysremove e1000e 10 kasan 2 1"
 	"nested-removal N10 plain nested - - hang 12 3"
 	"nested-surprise-removal N10 hooks nestsurprise prelock - hang 2 3"
 	"nested-bringup-deadlock N10 hooks nestbringup sysfs - hang 2 2"
