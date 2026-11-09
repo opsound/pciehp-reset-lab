@@ -284,6 +284,7 @@ def finish(a, d, n, kernel, binfo, q, stamp, timed_out, nact):
     summ += [l for l in txt.splitlines() if re.search(r"possible circular|possible recursive|blocked for more than|WARNING:|BUG:", l)
              and "] " in l][:20]
     summ += ["lockdep: %s" % x for x in rec["lockdep"]]
+    summ += ["ignored (test tool): %s" % x for x in rec["ignored"]]
     summ += ["hung tasks: %s" % " ".join(rec["hung_tasks"])] if rec["hung_tasks"] else []
     summ += ["VERDICT: %s" % rec["verdict"]]
     open(os.path.join(a.out, "summary.txt"), "w").write("\n".join(summ) + "\n")

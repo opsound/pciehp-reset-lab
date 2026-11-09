@@ -10,6 +10,12 @@ LOCKDEP_HDR = re.compile(r"WARNING: (possible circular locking dependency detect
                          r"lock held when returning to user space!|"
                          r"Nested lock was not taken|possible circular locking deadlock detected)")
 HUNG = re.compile(r"INFO: task (\S+) blocked for more than (\d+) seconds")
+# Reports of the test tools themselves, never counted as symptoms: aer_inject
+# (CONFIG_PCIEAER_INJECT, used through /dev/aer_inject) takes its spinlock_t
+# inject_lock in its pci_ops under the raw spinlock pci_lock, which lockdep
+# reports once per boot as "BUG: Invalid wait context" (PROVE_RAW_LOCK_NESTING)
+# and then turns itself off.  Recorded as "ignored" in result.json.
+IGNORED = (("Invalid wait context", "(inject_lock)"),)
 NUM = re.compile(r"^-?\d+(\.\d+)?$")
 FAILWORDS = ("FAIL", "HUNG", "HANG", "STUCK", "KASAN", "RESET-STUCK")
 
@@ -142,6 +148,17 @@ def metrics(text):
     return m
 
 
+def ignored_reports(klines):
+    """Headers of the reports listed in IGNORED, identified by a line of the
+    report that follows within a few lines."""
+    out = []
+    for i, (t, msg) in enumerate(klines):
+        for hdr, mark in IGNORED:
+            if hdr in msg and any(mark in m for _, m in klines[i + 1:i + 6]):
+                out.append("%s %s" % (hdr, mark))
+    return out
+
+
 def section(text, name):
     if not text:
         return None
@@ -180,6 +197,7 @@ def parse(serial, guest=""):
     # BUG:/KASAN, slub_debug ("BUG kmalloc-64 (Not tainted): Poison overwritten"),
     # oopses, list debugging, and the lifetime reports of lock debugging: lockdep's
     # "held lock freed!" and a freed/corrupted rwsem (DEBUG_RWSEMS magic check).
+    ignored = ignored_reports(kl)
     bugs = [msg for t, msg in kl if msg.startswith("BUG:") or "BUG: KASAN" in msg
             or re.match(r"BUG \S+ \(", msg) or msg.startswith(("Oops", "general protection fault"))
             or re.search(r"list_(add|del) corruption", msg) or "held lock freed!" in msg
@@ -217,6 +235,7 @@ def parse(serial, guest=""):
         "lockdep_detail": reps,
         "warnings": warns[:10],
         "bugs": bugs[:10],
+        "ignored": ignored[:5],
         "metrics": metrics(user),
     }
 
