@@ -1,16 +1,18 @@
 # pciehp, PCI slot/bus reset and device removal: deadlocks and use-after-frees in v7.4-rc1
 
-Base: v7.4-rc1 (6628e7d4c6b2). Code references are to that tree. Status as of 2026-11-06.
+Base: v7.4-rc1 (6628e7d4c6b2). Code references are to that tree. Status as of 2026-11-09.
 
 Conventions:
 - Test names refer to this lab (`./run test <name>`, table in the README). Tier 1 tests run on the exact
   v7.4-rc1 sources. Tier 2 tests need a TEST ONLY patch on top (`patches/test-hooks.patch`): debugfs
   hooks that emulate callers and events QEMU can't produce (AER/DPC recovery resets,
   pci_host_reset_root_port(), the link change a real port reports after a reset) and delays that widen
-  windows in pciehp, pci_device_add() and probe.
+  windows in pciehp, pci_device_add() and probe. "jh" tests also need CONFIG_JAILHOUSE_GUEST
+  (`configs/jh.config`) and Jailhouse's CPUID signature in the guest.
 - Counts are "failing runs / runs" on v7.4-rc1. Counts not tied to a lab test come from a larger set
   of scenario variants run during development; the lab's own counts are in the README.
-- This document describes the bugs only. Fix work and its status: [fix-status.md](fix-status.md).
+- This document describes the bugs only. Fix work, including the results of posted series in the lab,
+  and its status: [fix-status.md](fix-status.md).
 
 ---
 
@@ -67,10 +69,12 @@ disconnected.
 
 **Mainline status.** Unchanged in v7.4-rc1. Lab, exact mainline: `vfio-exit-deadlock` (process exit),
 `vfio-reset-deadlock` (VFIO_DEVICE_RESET), `sysfs-remove-deadlock` (sysfs "remove" as the lock holder)
-and `sriov-disable-deadlock` (sriov_numvfs=0 as the lock holder) all hang. With hooks,
-`host-reset-deadlock` covers the pci_host_reset_root_port() holder on hot-add (N2). Hung-task stacks on
-mainline: irq/B in pciehp_unconfigure_device(), irq/A in vfio_unregister_group_dev(), the exiting task
-in pciehp_reset_slot() via do_exit.
+and `sriov-disable-deadlock` (sriov_numvfs=0 as the lock holder) all hang, and so do
+`vfio-exit-surprise` and `vfio-reset-surprise`, variants of the first two in which both devices are
+surprise-removed (detached through their Root Ports' Slot Control) and keep their default reset
+methods. With hooks, `host-reset-deadlock` covers the pci_host_reset_root_port() holder on hot-add
+(N2). Hung-task stacks on mainline: irq/B in pciehp_unconfigure_device(), irq/A in
+vfio_unregister_group_dev(), the exiting task in pciehp_reset_slot() via do_exit.
 
 **Earlier reports.** E14 (SPDK, 2024, same cycle, open), E18 (Jinhui Guo, 2025, same cycle, not
 applied). Precursors fixed by f5eff5591b8f: E2, E3, E4 (E4's own trace by 74ff8864cc84). E17 also
@@ -280,7 +284,10 @@ but pciehp_ist() is single-threaded." (aFQ4ncPNdmUgyw63@wunner.de). No v2.
 2025-12-15
 https://lore.kernel.org/r/20251215123029.2746-1-guojinhui.liam@bytedance.com
 (v1: 20251208074459.1297-1-guojinhui.liam@bytedance.com)
-Exactly P0 with stacks; skips the release-time reset of a disconnected device. Matches P0.
+Exactly P0 with stacks. Meant to skip the release-time reset of a disconnected device, but the check
+sits inside the `if (pci_load_and_free_saved_state(...))` branch of vfio_pci_core_disable()
+(vfio_pci_core.c:757-763 in v7.4-rc1), which runs only if the saved state can't be reloaded, so it
+does not fire as posted. The report matches P0.
 Outcome: not applied. Alex Williamson thought the reset and hot-reset ioctls "can trigger this same
 deadlock" and suggested "a more comprehensive look at enabling vfio-pci to support surprise removal"
 (20251223153534.0968cc15.alex@shazbot.org). Author agreed to research it; no follow-up.
@@ -296,8 +303,10 @@ Outcome: open, no v2. Bjorn asked whether the pci_slot_reset() path has the same
 device_lock since d1c6c030fcec, and "It's unclear why pci_bus_reset() needs to acquire device_lock.
 This was introduced by 090a3c5322e9"; "Simply using trylock doesn't seem bullet-proof"; he suggested
 first looking into removal of the device_lock acquisition in pci_bus_reset()
-(aZ1H4IMMW_4w60EH@wunner.de). Tested here: the pci_slot_reset() path deadlocks the same way, and the
-posted patch fixes only the pci_bus_reset() path (N24).
+(aZ1H4IMMW_4w60EH@wunner.de). Tested here: the pci_slot_reset() path deadlocks the same way (N24). The
+patch's Fixes: tag names c4eed62a2143 (v4.20-rc1), which made AER recovery use slot resets; the bridge
+lock that the deadlock needs came with a4e772898f8b "PCI: Add missing bridge lock to pci_bus_lock()"
+(v6.11-rc1) for pci_bus_reset() and with 1f5e57c622b4 (v7.0-rc1) for pci_slot_reset().
 
 **E20. 2026-03-16, Guenter Roeck, "Re: [PATCH v3 2/2] PCI/IOV: Fix race between SR-IOV enable/disable and
 hotplug"**
@@ -473,10 +482,11 @@ remove_store(), a false positive; "remove" is DEVICE_ATTR_IGNORE_LOCKDEP in v7.4
 
 ---
 
-## 3. Issues (N1-N24)
+## 3. Issues (N1-N27)
 
 N1-N10 and N15-N24 were found while testing; N11-N14 were found by review or are known from earlier
-reports. All of them are present in v7.4-rc1. Earlier versions of this catalog called N11-N14 R1-R5
+reports; N25-N27 were found while testing posted series (W9, W12). All of them are present in
+v7.4-rc1. Earlier versions of this catalog called N11-N14 R1-R5
 (R1 = N11, R2 = N12, R3 and R5 = N13, R4 = N14).
 
 ### N1. pciehp_configure_device() re-acquires reset_lock with pci_rescan_remove_lock held
@@ -557,16 +567,30 @@ reports. All of them are present in v7.4-rc1. Earlier versions of this catalog c
   so do the checks whether a bus or slot can be reset at all (pci_bus_resettable(), pci.c:5402;
   pci_slot_resettable(), :5512). pci_destroy_dev() unlinks under pci_bus_sem without the device lock and
   drops the last reference (remove.c:47-58). Results: use-after-free, list-poison GPF, or a device lock
-  taken by the lock walk and never released by the unlock walk (E25).
+  taken by the lock walk and never released by the unlock walk (E25). The walks also see devices added
+  meanwhile (pci_device_add() takes only pci_bus_sem, probe.c:2765-2767): a device added between the
+  lock walk and the unlock walk is unlocked without having been locked, e.g. VFs that
+  sriov_numvfs_store(), waiting for their PF's device lock, adds once the unlock walk releases it and
+  before the walk reads the next entry: lockdep's "bad unlock balance" for &dev->mutex in
+  __pci_bus_unlock() and a WARNING in pci_cfg_access_unlock() (access.c:340).
 - Introduced by: 090a3c5322e9 "PCI: Add pci_reset_slot() and pci_reset_bus()" (v3.12-rc1).
 - Impact: memory corruption, oops, or leaked device locks (bind/unbind hang) when a slot/bus reset
-  (reset_subordinate, AER, vfio hot reset) races device removal.
-- Lab: `reset-removal-uaf` (hooks, KASAN: AER-style resets of two Root Ports in loops while pciehp
-  tears down a vfio-pci device below one of them): KASAN reports on mainline, in 6 of 23 runs of 20
-  rounds each. Over 48 KASAN runs of four
-  variants (resets through reset_subordinate, vfio hot reset and AER-style resets), mainline crashed in
-  5 and hung in 12 more. Reports include slab-use-after-free in pci_save_dpc_state() and in __mutex_lock
-  (device_lock of a freed device), and a GPF at LIST_POISON in pci_try_reset_slot() and __pci_bus_lock().
+  (reset_subordinate, AER, vfio hot reset) races device removal; unlocks of locks never taken when it
+  races device addition.
+- Lab: `reset-removal-uaf` (hooks, KASAN: AER-style resets of two hotplug Root Ports in loops while
+  pciehp tears down a vfio-pci device below one of them; the resets are slot resets, pci_slot_reset(),
+  not pci_bus_reset()): KASAN reports on mainline, in 6 of 23 runs of 20 rounds each. Over 48 KASAN
+  runs of four variants (resets through reset_subordinate, vfio hot reset and AER-style resets),
+  mainline crashed in 5 and hung in 12 more. Reports include slab-use-after-free in
+  pci_save_dpc_state() and in __mutex_lock (device_lock of a freed device), and a GPF at LIST_POISON in
+  pci_try_reset_slot() and __pci_bus_lock(). `bus-reset-removal-uaf` (hooks, KASAN) covers
+  pci_bus_reset(): AER-style resets of a Root Port without a hotplug slot in a loop while the switch
+  below is removed through sysfs; on v7.4-rc1 the first round leaks a device lock taken in
+  __pci_bus_lock() ("lock held when returning to user space", 13 of 13 runs in development); with the
+  scenario continuing past the leak (`+cont`), 1 of 4 runs also hit a slab-use-after-free in
+  __pci_bus_unlock(). Its `sub` variant (reset_subordinate, pci_try_reset_bus()) leaks the lock in
+  __pci_bus_trylock() (3 of 3). `reset-holds-probing` (N16) shows the unbalanced unlock of an added
+  device in the runs that don't deadlock (3 of 6 in development).
 - Earlier reports: E21 (real-world GPF, one path removed), E25/W4 (lock leak). Same class, fixed earlier
   for the DPC wait only: 11a1f4bc4736 (v6.11-rc1).
 
@@ -677,14 +701,18 @@ reports. All of them are present in v7.4-rc1. Earlier versions of this catalog c
   together; pci_rescan_remove_lock stays held.
 - Lab: `nested-removal` (exact mainline: remove a NIC below a switch Downstream Port and the switch at
   nearly the same time) hangs in some runs on mainline (free_irq() in the stacks; 6 of 13 runs on
-  v7.4-rc1). Variants, all with hooks that order the tasks: `nested-bringup-deadlock` (a hook holds the
-  lock, the remover of the switch's Upstream Port queues on it, a NIC is hot-added on an empty
-  Downstream Port), 12 of 12 runs hung on v7.4-rc1; `port-unbind-deadlock` (sysfs unbind of an empty
-  Downstream Port's pcieport driver while its IRQ thread waits for the lock to enumerate a hot-added
-  card, and a hook that removes the switch with the lock held, as acpiphp and host bridge removal do,
-  waits for the port), 12 of 12 hung; `port-unbind-host-reset` (the same with an emulated
-  pci_host_reset_root_port() as the lock holder, whose bus reset waits for the port, and a slot
-  power-off as the IRQ thread's event), 6 of 6 hung.
+  v7.4-rc1). `nested-surprise-removal` (hooks: the NIC below a Downstream Port is surprise-removed, the
+  Downstream Port's IRQ thread is held for 3 s between its slot power check and pci_rescan_remove_lock
+  by a TEST ONLY delay, and a link change on the Root Port above makes its pciehp surprise-remove the
+  switch) hangs with the Root Port's IRQ thread in free_irq() and the Downstream Port's in
+  pciehp_unconfigure_device() (6 of 6 runs in development). Variants, all with hooks that order the
+  tasks: `nested-bringup-deadlock` (a hook holds the lock, the remover of the switch's Upstream Port
+  queues on it, a NIC is hot-added on an empty Downstream Port), 12 of 12 runs hung on v7.4-rc1;
+  `port-unbind-deadlock` (sysfs unbind of an empty Downstream Port's pcieport driver while its IRQ
+  thread waits for the lock to enumerate a hot-added card, and a hook that removes the switch with the
+  lock held, as acpiphp and host bridge removal do, waits for the port), 12 of 12 hung;
+  `port-unbind-host-reset` (the same with an emulated pci_host_reset_root_port() as the lock holder,
+  whose bus reset waits for the port, and a slot power-off as the IRQ thread's event), 6 of 6 hung.
 - Earlier reports: E0 (Xiongfeng Wang 2018/2019, sysfs remover), E1 (2018), E8 (2024), E12, E15
   (real-world, triggers avoided by e3260237aaad), E10 (per-bus lock alternative), E30 (Keith Busch
   2018), W3 (Keith Busch RESEND, 2025).
@@ -865,7 +893,8 @@ reports. All of them are present in v7.4-rc1. Earlier versions of this catalog c
   after the rescan at random, 4 of 7, all with offsets up to 16 ms). The scenario's `pciehp` variant
   (pciehp sleeps after scanning a hot-added NIC with the lock held, through a TEST ONLY knob) hangs
   every time. With a Root Port that has a hotplug slot, the no-delay runs hang on N8 instead in about a
-  third of the runs (6 of 16 with a two-function e1000e; 10 in this cycle).
+  third of the runs (6 of 16 with a two-function e1000e; 10 in this cycle). Runs that don't deadlock
+  can show N4's unbalanced unlock of the VFs that sriov_numvfs_store() added during the reset.
 - Earlier reports: no earlier report found.
 
 ### N17. reset_subordinate and pci_reset_bridge() use the secondary bus without a reference
@@ -1059,10 +1088,85 @@ reports. All of them are present in v7.4-rc1. Earlier versions of this catalog c
   the bus-reset path (the Root Port without a hotplug slot); with an error every 200 ms, 9 of 16. A
   single error is enough but the window is narrow: injected right after the endpoint's shutdown, it
   hung 1 of 32 runs with the slot-reset path and 0 of 32 with the bus-reset path; injected when the
-  poweroff starts, 0 of 64. Without errors at poweroff, 0 of 12. The trylock patch posted in E19 fixes
-  only the pci_bus_reset() path: with it, the slot-reset path still hung in 8 of 8 runs. No hooks or
-  delay knobs.
+  poweroff starts, 0 of 64. Without errors at poweroff, 0 of 12. No hooks or delay knobs.
 - Earlier reports: E19 (Ziming Du, 2026, open).
+
+### N25. Slot/bus resets disable a bridge before the drivers below it prepare for the reset
+- Mechanism: pci_slot_save_and_disable_locked() and pci_bus_save_and_disable_locked() (pci.c:5585-5596,
+  5552-5561) call pci_dev_save_and_disable() for a device before recursing into its secondary bus.
+  pci_dev_save_and_disable() calls the driver's ->reset_prepare() and then clears the Command register
+  (pci.c:5134-5169), so a Switch Upstream Port stops forwarding memory requests before the drivers
+  below it get their ->reset_prepare(); their MMIO then fails (Unsupported Requests on hardware, the
+  AER report in W9; in QEMU writes are dropped and reads return 0). virtio-pci's ->reset_prepare()
+  (virtio_pci_reset_prepare() -> virtio_device_reset_prepare(), virtio.c:700) has virtio-blk freeze its
+  queue (virtblk_freeze_priv(), virtio_blk.c:1591), which waits for the requests in flight. A request
+  whose doorbell write went to the disabled Upstream Port never completes, so the reset waits forever
+  holding the device locks of the whole hierarchy.
+- Introduced by: 090a3c5322e9 "PCI: Add pci_reset_slot() and pci_reset_bus()" (v3.12-rc1), which
+  disables the devices top-down (the Fixes: tag of W9). The hang needs a ->reset_prepare() that waits
+  for the device, as virtio-blk's has since 5820a3b08987 and a0ec4fb63f5c (v6.14-rc1).
+- Impact: reset_subordinate, a vfio hot reset or an error recovery bus reset of a port with a switch
+  below hangs if a driver below waits for its device in ->reset_prepare(); otherwise those drivers'
+  last MMIO accesses fail (AER Unsupported Request errors, reads of ~0).
+- Lab: `reset-prepare-order` (exact mainline: a Root Port above a QEMU x3130 switch with a virtio-blk
+  below one Downstream Port and an e1000e below the other; direct reads from the disk in a loop while
+  reset_subordinate of the Root Port runs 3 times): hangs on v7.4-rc1 in blk_mq_freeze_queue_wait() <-
+  virtblk_freeze_priv() <- virtio_device_reset_prepare() <- pci_dev_save_and_disable() <-
+  pci_bus_save_and_disable_locked() <- pci_try_reset_slot() <- pci_reset_bridge(), with one read in
+  flight. In development, 11 of 11 runs hung (slot and bus variants, KASAN included); without I/O, the
+  status read in virtio's ->reset_prepare() returned 0 instead of the live status in 7 of 7 runs.
+- Earlier reports: W9 (Lukas Wunner, 2026-09-15, for the AER report of a reset_subordinate with a
+  switch below).
+
+### N26. With isolated functions, a slot without function 0 oopses pcie_aspm_init_link_state()
+- Mechanism: when hypervisor_isolated_pci_functions() is true (s390, LoongArch, Jailhouse;
+  include/linux/hypervisor.h:35-44), pci_scan_slot() goes on to functions 1-7 when function 0 is absent
+  (probe.c:2890-2898) and, having found some, calls pcie_aspm_init_link_state() for the bridge above
+  (:2903-2904). alloc_pcie_link_state() sets link->downstream to pci_function_0(), which returns NULL
+  without a function 0 on the bus (aspm.c:281-289, 1174), and pcie_aspm_cap_init() dereferences it.
+- Introduced by: db360b1ea7fa "PCI: Move jailhouse's isolated function handling to pci_scan_slot()"
+  (v6.0-rc1), which made pci_scan_slot() add such functions and set up ASPM for them (690f4304104f,
+  v4.17-rc1, had scanned them separately); extended to s390 by 189c6c33ff42 (v6.0-rc1) and to
+  LoongArch by a02fd05661d7 (v6.17-rc1). link->downstream comes from pci_function_0() since
+  b5a0a9b59c81 and 3bd7db63a841 (v4.11).
+- Impact: NULL pointer dereference when a bridge's secondary bus holds functions without function 0
+  and ASPM support is enabled: in the boot scan (a panic) or on a rescan or hot-add. Functions passed
+  to s390 and Jailhouse guests usually sit on a root bus, which has no bridge to set up ASPM for.
+- Lab: `isolated-fn-aspm-oops` (hooks, jh: a two-function e1000e hot-added while a TEST ONLY knob hides
+  function 0 right after pciehp's link check found it, so that pci_scan_slot() finds function 1 only;
+  QEMU exposes a hot-added function only once function 0 is there): "BUG: kernel NULL pointer
+  dereference" at pcie_aspm_init_link_state+0x21f <- pci_scan_slot() <- pciehp_configure_device() on
+  v7.4-rc1. Without hooks, function 1 of an e1000e alone at boot (isolfn scenario, `--var boot-aspm`)
+  oopses the same way in the boot scan, <- acpi_pci_root_create(), which kills init; the harness
+  counts a guest that never boots as an error, so no test uses it.
+- Earlier reports: none found. Found while testing W12.
+
+### N27. pciehp's device identity checks assume function 0
+- Mechanism: pciehp caches the Device Serial Number of function 0 after enumerating a slot
+  (pciehp_configure_device(), pciehp_pci.c:75-76) and on resume compares function 0's identity with the
+  cached one (pciehp_device_replaced(), pciehp_hpc.c:567-594, called from pciehp_resume_noirq(),
+  pciehp_core.c:306). With isolated functions (N26) a slot can hold functions without function 0:
+  - Resume: pciehp_device_replaced() returns true when pci_get_slot(00.0) finds nothing (:575-577), so
+    every system sleep, s2idle included, marks the slot's devices disconnected and synthesizes Presence
+    Detect Changed. The IRQ thread removes them, and re-enumeration stops in
+    pciehp_check_link_status(), which waits for function 0 (pci_bus_check_dev(), pciehp_hpc.c:305-327,
+    "No device found"): the functions are gone until reboot.
+  - Hot-add: pciehp_configure_device() passes pci_get_slot(00.0) to pci_get_dsn() without a NULL
+    check. pciehp_check_link_status() requires function 0, so this needs function 0 to answer the link
+    check and be gone when pci_scan_slot() runs; pci_get_dsn(NULL) then dereferences NULL.
+- Introduced by: 9d573d19547b "PCI: pciehp: Detect device replacement during system sleep"
+  (v6.11-rc1).
+- Impact: functions without function 0 in a hotplug slot disappear on the first suspend/resume; a
+  NULL pointer dereference in the pciehp IRQ thread if function 0 vanishes during a hot-add.
+- Lab: `isolated-fn-resume-removal` (jh: function 1 of an e1000e alone at boot in a slot without power
+  controller, pcie_aspm=off because of N26, then s2idle with pm_test=platform): the slot is torn down
+  on resume and 01:00.1 is not re-added on v7.4-rc1. `hotadd-fn0-vanish` (hooks, jh: a two-function
+  e1000e hot-added while a TEST ONLY knob hides function 0 right after the link check found it,
+  pcie_aspm=off): "BUG: kernel NULL pointer dereference" in pci_get_dsn() <- pciehp_configure_device()
+  on v7.4-rc1 (6 of 6 runs in development).
+- Earlier reports: W12 (Priyank Rathod, 2026-10-12) for the NULL dereference; its trigger, a hot-add
+  of a card without function 0, stops in pciehp_check_link_status(). The Sashiko review of W12 pointed
+  out the resume teardown (sashiko-outbox-168676@kernel.org).
 
 ---
 
@@ -1160,8 +1264,8 @@ Status: in review.
 
 **W9. Lukas Wunner, "[PATCH] PCI: Fix order of device disablement on reset"**, 2026-09-15
 https://lore.kernel.org/r/4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de
-Reorders pci_bus_save_and_disable_locked() and pci_slot_save_and_disable_locked(). Unrelated to these
-issues.
+Reorders pci_bus_save_and_disable_locked() and pci_slot_save_and_disable_locked() to disable bottom-up.
+Addresses N25.
 Status: respin announced (aqvfUldY5mGMMYrG@wunner.de).
 
 **W10. Alex Williamson, "[RFC PATCH 0/5] PCI/vfio-pci: Guard resets against active SR-IOV VFs"**,
@@ -1181,7 +1285,8 @@ Status: not a formal proposal (author's words); superseded in practice by W6.
 **W12. Priyank Rathod, "[PATCH] PCI: pciehp: Fix NULL pointer dereference in
 pciehp_configure_device()"**, 2026-10-12
 https://lore.kernel.org/r/20261012-pcie-hotplug-nullref-v1-1-6e21c2e89ea4@google.com
-NULL check for the DSN read after re-acquiring reset_lock (a bug of its own, not N1).
+NULL check for the DSN read after re-acquiring reset_lock: the hot-add half of N27 (not N1). Its
+review by Sashiko raised the resume half (sashiko-outbox-168676@kernel.org).
 Status: posted; sashiko comment only.
 
 Maintainer positions from earlier threads:
@@ -1204,17 +1309,17 @@ Maintainer positions from earlier threads:
 
 | ID | Summary | Earlier reports (section 2) | In-flight work (section 4) | Lab tests |
 |---|---|---|---|---|
-| P0 | pciehp holds reset_lock waiting for pci_rescan_remove_lock; vfio close-time reset waits for that reset_lock | E14, E18 (same); E2, E3, E4 (precursors, fixed by f5eff5591b8f; E4 also by 74ff8864cc84); E17 (similar reordering, judged lockdep false positive); E7, E27 (related) | W1 (partial), W5, W6 (related) | vfio-exit-deadlock, vfio-reset-deadlock, sysfs-remove-deadlock, sriov-disable-deadlock |
-| N1 | reset_lock re-acquired with pci_rescan_remove_lock held | E6, E13, E17 | W1; W12 (same lines) | hotadd-lockdep, nested-lockdep |
+| P0 | pciehp holds reset_lock waiting for pci_rescan_remove_lock; vfio close-time reset waits for that reset_lock | E14, E18 (same); E2, E3, E4 (precursors, fixed by f5eff5591b8f; E4 also by 74ff8864cc84); E17 (similar reordering, judged lockdep false positive); E7, E27 (related) | W1 (partial), W5, W6 (related) | vfio-exit-deadlock, vfio-reset-deadlock, vfio-exit-surprise, vfio-reset-surprise, sysfs-remove-deadlock, sriov-disable-deadlock |
+| N1 | reset_lock re-acquired with pci_rescan_remove_lock held | E6, E13, E17 | W1; W12 (same lines, N27) | hotadd-lockdep, nested-lockdep |
 | N2 | pci_host_reset_root_port() holds pci_rescan_remove_lock across slot reset | E24 | W1; W7 (new caller) | host-reset-deadlock |
 | N3 | pci_get_slot() under reset_lock in pciehp_ignore_link_change() | none | none | spurious-link-lookup-deadlock |
-| N4 | reset walks of bus->devices vs removal (UAF, GPF, leaked lock) | E21, E25 | W4 | reset-removal-uaf |
+| N4 | reset walks of bus->devices vs removal or addition (UAF, GPF, leaked lock, unbalanced unlock) | E21, E25 | W4 | reset-removal-uaf (slot path), bus-reset-removal-uaf (bus path); reset-holds-probing (unbalanced unlock) |
 | N5 | resets lock devices not yet device_add()ed | none | none | reset-adding-device |
 | N6 | ->reset_slot() in flight during hotplug driver unbind (UAF) | E2, E3 (maintainer remarks) | none | pciehp-unbind-uaf, reset-pciehp-unbind |
 | N7 | queued slot reset hits devices while drivers bind | none (W4 notes the window) | W4 (limitation) | reset-before-bind, reset-after-scan |
 | N8 | pci_slot_mutex held across slot resets | E3 (2/2), E11, E24 | W1 (partial) | reset-storm, reset-during-bind, slot-mutex-lockdep, aer-hotadd-race, reset-pciehp-unbind |
 | N9 | remove_store() UAF after device_remove_file_self() | E9, E10 (8/8) | W2 2/5 touches the same code | sysfs-remove-uaf |
-| N10 | nested ports: free_irq() vs IRQ thread waiting for pci_rescan_remove_lock; bring-up, port-unbind and resetting-holder variants | E0, E1, E8, E10, E12, E15, E30 | W3 | nested-removal, nested-bringup-deadlock, port-unbind-deadlock, port-unbind-host-reset |
+| N10 | nested ports: free_irq() vs IRQ thread waiting for pci_rescan_remove_lock; bring-up, port-unbind and resetting-holder variants | E0, E1, E8, E10, E12, E15, E30 | W3 | nested-removal, nested-surprise-removal, nested-bringup-deadlock, port-unbind-deadlock, port-unbind-host-reset |
 | N11 | recovery walks and the post-reset wait take pci_bus_sem against device locks | E16, E29, E32, E33 | W6 (same pattern) | sriov-recovery-walk-deadlock, recovery-walk-deadlock |
 | N12 | recovery reset hits a device bound after error_detected | E26 (related) | W6, W11 (related) | recovery-hotadd-msix, aer-hotadd-race |
 | N13 | sriov_numvfs_store() vs PF removal (sysfs, pciehp) | E20, E22, E23 (related) | W2 (sysfs remove of the PF only) | sriov-remove-abba, sriov-pciehp-abba |
@@ -1229,3 +1334,6 @@ Maintainer positions from earlier threads:
 | N22 | removal holds pci_rescan_remove_lock while vfio-pci waits for user space | E7, E18 (related) | W6 (related) | removal-stall |
 | N23 | binding to a device whose removal has begun | E20 (remark) | none | bind-during-removal |
 | N24 | device_shutdown() vs AER recovery | E19 | none | shutdown-aer-deadlock |
+| N25 | slot/bus resets disable a bridge before the drivers below prepare | none (W9's changelog reports it) | W9 | reset-prepare-order |
+| N26 | isolated functions: no function 0, NULL link->downstream in pcie_aspm_init_link_state() | none | none | isolated-fn-aspm-oops |
+| N27 | pciehp's DSN and identity checks assume function 0 (resume teardown, NULL DSN read) | none (W12's changelog reports the hot-add half) | W12 (hot-add half) | isolated-fn-resume-removal, hotadd-fn0-vanish |
