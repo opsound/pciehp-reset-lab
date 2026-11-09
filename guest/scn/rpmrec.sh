@@ -21,6 +21,13 @@
 # "+pin" (e.g. remove+pin) pins the slot reset loop to a CPU other than the
 # IRQ thread's: the IRQ thread is SCHED_FIFO and doesn't sleep between the two
 # reads, so a writer on its CPU can't queue in between.
+#
+# RESULT: FAIL HANG if the power write doesn't return within 45 s, FAIL
+# LOCKDEP-N18 if lockdep reports the recursive reset_lock read (n18_lockdep=),
+# else PASS.  Other lockdep reports (other_lockdep=, e.g. N1's circular
+# reset_lock/pci_rescan_remove_lock report on removal, after which lockdep is
+# off and can't report N18) don't change the result; the harness still
+# counts them.
 RP=0000:00:10.0
 SLOT=1
 OPTS=${var#*+}; [ "$OPTS" = "$var" ] && OPTS=
@@ -75,7 +82,7 @@ fi
 
 dmesg -n 5	# slot_reset logs two lines per reset; keep warnings on the console
 H0=$(nhung)
-L0=$(dmesg | grep -cE 'possible recursive|possible circular')
+L0=$(lockdep_sigs | wc -l)
 IRQ=$(dmesg | grep -m1 "pcieport $RP: PME: Signaling with IRQ" | awk '{print $NF}')
 IST=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "irq/$IRQ-pciehp" ] && echo ${p#/proc/}; done | head -1)
 ISTCPU=$(awk '{print $39}' /proc/$IST/stat 2>/dev/null)
@@ -112,14 +119,17 @@ fi
 dstacks "after power write (stuck=$STUCK)"
 kill $WR 2>/dev/null
 H=$(( $(nhung) - H0 ))
-L=$(( $(dmesg | grep -cE 'possible recursive|possible circular') - L0 ))
+SIGS=$(lockdep_sigs | tail -n +$((L0 + 1)))
+[ -n "$SIGS" ] && echo "$SIGS" | sed 's/^/lockdep report: /'
+N18=$(echo "$SIGS" | grep -cx "recursive &ctrl->reset_lock")
+LO=$(echo "$SIGS" | grep -vx "recursive &ctrl->reset_lock" | grep -c .)
 log "after: nics=$(devs $NIC_V $NIC_D | wc -l) port: $(rpm) resets=$(dmesg | grep -c 'pcitest2: slot_reset .*done')"
 lockdep_check
 if [ $STUCK = 1 ]; then
 	NO_ADDED_CHECK=1	# the slot is stuck
-	result "FAIL HANG power write blocked, hung=$H lockdep=$L"
-elif [ $L -gt 0 ]; then
-	result "FAIL LOCKDEP recursive reset_lock read, no hang, hung=$H"
+	result "FAIL HANG power write blocked, hung=$H n18_lockdep=$N18 other_lockdep=$LO"
+elif [ $N18 -gt 0 ]; then
+	result "FAIL LOCKDEP-N18 recursive reset_lock read, power write returned, hung=$H other_lockdep=$LO"
 else
-	result "PASS no hang, no lockdep report"
+	result "PASS power write returned, hung=$H n18_lockdep=0 other_lockdep=$LO"
 fi

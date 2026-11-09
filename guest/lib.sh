@@ -74,6 +74,17 @@ lockdep_check() {
 	echo "LOCKDEP-LINES: $(dmesg | grep -cE 'possible circular|possible recursive|DEADLOCK')"
 	echo "KASAN-LINES: $(dmesg | grep -c 'BUG: KASAN')"
 }
+# lockdep_sigs: one line per lockdep circular or recursive locking report so
+# far, "KIND LOCK", LOCK being the lock the task was trying to acquire, e.g.
+# "recursive &ctrl->reset_lock"
+lockdep_sigs() {
+	dmesg | awk '
+		/WARNING: possible recursive locking detected/ { k = "recursive"; next }
+		/WARNING: possible circular locking dependency detected/ { k = "circular"; next }
+		k != "" && /is trying to acquire lock:/ { w = 1; next }
+		w { if (match($0, /\([^(){}]*\)\{/)) print k, substr($0, RSTART + 1, RLENGTH - 3); else print k, "?"; w = 0; k = "" }
+	'
+}
 # trace_on FUNC...: function tracer on the given functions; functions the
 # kernel doesn't have (renamed/inlined in a candidate) are skipped.
 trace_on() {
