@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 # Classify one run's result.json into symptoms and compare with an expectation.
-# Usage: check.py <result.json> <clean|hang|lockdep|kasan|oops|warn|fail>
+# Usage: check.py <result.json> <clean|pass|hang|lockdep|kasan|oops|warn|fail>
 # Symptoms:
 #   hang     the guest never finished, hung tasks were reported, or the
 #            scenario reported a stuck operation
@@ -14,7 +14,10 @@
 #   skip     the scenario didn't run (a hook it needs is missing)
 #   error    the guest never booted (harness or QEMU failure)
 # "clean" means none of them.  Exit 0 if the expectation is met: "clean"
-# requires no symptom, any other expectation requires that symptom.
+# requires no symptom; "pass" (series checks) requires that the scenario's own
+# check passed and that nothing hung, crashed or hit KASAN, but allows lockdep
+# reports and warnings, such as N1's lockdep report on the first hot-add; any
+# other expectation requires that symptom.
 import json, re, sys
 
 FAILWORDS = ("FAIL", "HUNG", "HANG", "STUCK", "KASAN")
@@ -53,7 +56,12 @@ def main():
     rec = json.load(open(sys.argv[1]))
     want = sys.argv[2]
     got = symptoms(rec)
-    ok = not got if want == "clean" else want in got
+    if want == "clean":
+        ok = not got
+    elif want == "pass":
+        ok = not set(got) & {"hang", "kasan", "oops", "fail", "skip", "error"}
+    else:
+        ok = want in got
     detail = rec.get("outcome") or rec.get("result") or "no result"
     print("observed %s; scenario: %s" % (",".join(got) or "clean", detail))
     sys.exit(0 if ok else 1)

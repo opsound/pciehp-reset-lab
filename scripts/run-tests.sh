@@ -9,10 +9,12 @@ logs="${root}/out/logs"
 usage()
 {
 	cat >&2 <<EOF
-usage: $0 [--suite bugs|fixes] [--tree TREE]... [--jobs N] [--runs N] [--all-runs] [--dry-run] [SELECTION]
+usage: $0 [--suite bugs|fixes|checks] [--tree TREE]... [--jobs N] [--runs N] [--all-runs] [--dry-run] [SELECTION]
   --suite bugs   (default) every test on v7.4-rc1, expecting its bug's symptom
   --suite fixes  every test plus the fix tracking tests on each --tree (default:
                  the trees of configs/fix-trees.conf), expecting "clean"
+  --suite checks the series checks: on v7.4-rc1, expecting each check's
+                 v7.4-rc1 result; with --tree, on those trees, expecting "pass"
   --runs N       runs per entry (default: the test's runs or fixruns)
   --all-runs     bug suite: do every run instead of stopping at the first one
                  that shows the symptom, to measure its rate
@@ -92,7 +94,29 @@ FIXTESTS=(
 	"linkdown-hotadd-bars - hooks-hc linkdownadd - - - - 3"
 	"pf-probe-sriov-removal - hooks pfprobe - - - - 2"
 )
-TEST_NAMES="$(for t in "${TESTS[@]}" "${FIXTESTS[@]}"; do echo -n "${t%% *} "; done)"
+# Series checks: tests written for posted series, of problems outside the
+# catalog (what a series claims to fix) or of regressions a series introduced.
+# Not bugs of the catalog, so neither in the bug suite nor in fix tracking.
+# Fields as for TESTS; the expectation is the result on v7.4-rc1, "pass" for
+# the regression checks (harness/check.py: the scenario's check passes; lockdep
+# reports and warnings, such as N1's, don't count).  On a --tree every run has
+# to pass.
+CHECKS=(
+	"pf-reset-vf-wipe - plain sriovguard sysfs - fail 1 2"
+	"pf-reset-vf-wipe-vfio - plain sriovguard vfio - fail 1 2"
+	"vfio-recovery-restore - plain vfiorec ep - fail 1 2"
+	"vfio-recovery-restore-switch - plain vfiorec sw - fail 1 2"
+	"aer-unbound - plain aerunb new - fail 1 2"
+	"aer-unbound-mf - plain aerunb mf - fail 1 2"
+	"aer-unbound-vfs - plain aerunb vfs - fail 1 2"
+	"aer-no-handler - plain aerunb nohandler - pass 2 2"
+	"dpcwait-slow - hooks dpcwait slow - fail 1 2"
+	"dpcwait-dead - hooks dpcwait dead - pass 2 2"
+	"vfio-pm-sriov-race - plain pmsriov - 10 warn 1 3"
+	"numa-pf-probe-hotadd - plain numaprobe pciehp - pass 2 2"
+	"numa-pf-probe-rescan - plain numaprobe rescan - pass 2 2"
+)
+TEST_NAMES="$(for t in "${TESTS[@]}" "${FIXTESTS[@]}" "${CHECKS[@]}"; do echo -n "${t%% *} "; done)"
 
 suite=bugs jobs=1 runs_override="" dry_run=0 all_runs=0 trees=()
 while [ $# -gt 0 ]; do
@@ -111,7 +135,7 @@ while [ $# -gt 0 ]; do
 done
 [ $# -le 1 ] || usage
 selection="${1:-all}"
-case "${suite}" in bugs|fixes) ;; *) usage ;; esac
+case "${suite}" in bugs|fixes|checks) ;; *) usage ;; esac
 if [ "${suite}" = fixes ] && [ ${#trees[@]} -eq 0 ]; then
 	mapfile -t trees < <("${root}/scripts/build.sh" list-trees)
 fi
@@ -155,6 +179,7 @@ add_entries() # suite tree defs...
 		kernel="$(kernel_for "${s}" "${tr}" "${flavor}")"
 		if [ "${s}" = fixes ]; then
 			expect=clean runs="${fixruns}"
+			[ "${suite}" = checks ] && expect=pass
 		fi
 		if selected "${kernel}" "${name}" "${issue}"; then
 			entries+=("${kernel} ${name} ${scn} ${var} ${rounds} ${expect} ${runs_override:-${runs}}")
@@ -163,6 +188,12 @@ add_entries() # suite tree defs...
 }
 if [ "${suite}" = bugs ]; then
 	add_entries bugs - "${TESTS[@]}"
+elif [ "${suite}" = checks ] && [ ${#trees[@]} -eq 0 ]; then
+	add_entries bugs - "${CHECKS[@]}"
+elif [ "${suite}" = checks ]; then
+	for tr in "${trees[@]}"; do
+		add_entries fixes "${tr}" "${CHECKS[@]}"
+	done
 else
 	for tr in "${trees[@]}"; do
 		add_entries fixes "${tr}" "${TESTS[@]}" "${FIXTESTS[@]}"
@@ -194,7 +225,7 @@ run_entry() # kernel test scenario var rounds expect runs
 {
 	local kernel="$1" test="$2" scn="$3" var="$4" rounds="$5" expect="$6" runs="$7"
 	local image="${root}/out/linux-${kernel}/arch/x86/boot/bzImage"
-	local dir i n=0 met=0 bad=0 hits=0 line args=()
+	local dir i n=0 met=0 bad=0 hits=0 line args=() every=0
 
 	[ "${var}" = - ] || args+=(--var "${var}")
 	[ "${rounds}" = - ] || args+=(--a "${rounds}")
@@ -203,6 +234,7 @@ run_entry() # kernel test scenario var rounds expect runs
 		echo "FAIL: ${kernel}:${test}; missing ${image}"
 		return 1
 	fi
+	case "${expect}" in clean|pass) every=1 ;; esac
 	echo "==> Running ${kernel}:${test} (expect ${expect})"
 	for i in $(seq 1 "${runs}"); do
 		dir="${logs}/${kernel}/${test}/${i}"
@@ -218,13 +250,13 @@ run_entry() # kernel test scenario var rounds expect runs
 		fi
 		echo "    run ${i}: ${line}; log: ${dir}/serial.log"
 		# A symptom shows up once: stop, unless measuring its rate.  A
-		# clean expectation runs them all.
-		if [ "${expect}" != clean ] && [ "${met}" = 1 ] && [ "${all_runs}" = 0 ]; then
+		# clean or pass expectation runs them all.
+		if [ "${every}" = 0 ] && [ "${met}" = 1 ] && [ "${all_runs}" = 0 ]; then
 			break
 		fi
 	done
-	if { [ "${expect}" = clean ] && [ "${bad}" = 0 ]; } ||
-	   { [ "${expect}" != clean ] && [ "${met}" = 1 ]; }; then
+	if { [ "${every}" = 1 ] && [ "${bad}" = 0 ]; } ||
+	   { [ "${every}" = 0 ] && [ "${met}" = 1 ]; }; then
 		echo "PASS: ${kernel}:${test} (expected ${expect}; met in ${hits}/${n} runs)"
 		return 0
 	fi

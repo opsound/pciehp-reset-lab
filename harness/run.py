@@ -6,7 +6,8 @@
 # summary, dmesg), host.txt, summary.txt and result.json to <outdir>.
 #
 # Usage: run.py <bzImage> <scenario> <outdir> [--var V] [--n N] [--a A]
-#               [--timeout S] [--kasan] [--cpu CPU] [--qemu PATH] [--initrd F]
+#               [--timeout S] [--kasan] [--cpu CPU] [--smp SMP] [--qemu PATH]
+#               [--initrd F]
 # Per-scenario defaults (SCN below) supply var, n, timeout, kernel arguments and
 # topology, per variant where by_var says so.
 #
@@ -31,14 +32,20 @@ import qxparse  # noqa: E402
 # topology, nestdevs: devices below the switch, rpsopts: extra properties of
 # the switch's root port, rpopts: extra properties of rp1..rpN, qemu_extra:
 # more -device arguments, post_extra: -device arguments that need the switch's
-# ports, append: extra kernel args, cpu: -cpu, lockdep_check: a lockdep report
-# fails the run, shutdown_check: seconds to wait for the poweroff after the
-# guest is done (its result depends on it: qxparse "CHECK: poweroff"), by_var:
-# per-variant overrides.
+# ports, append: extra kernel args, cpu: -cpu, smp: -smp, lockdep_check: a
+# lockdep report fails the run, shutdown_check: seconds to wait for the
+# poweroff after the guest is done (its result depends on it: qxparse "CHECK:
+# poweroff"), by_var: per-variant overrides.
 PCP_OFF = "power_controller_present=off"
 # A Root Port without a hotplug slot, with an igb PF present at boot.
 RPC_IGB = ["-device", "pcie-root-port,id=rpc,bus=pcie.0,chassis=50,slot=50,addr=0x1d,hotplug=off",
            "-device", "igb,id=pf1,bus=rpc"]
+# Two NUMA nodes of 4 CPUs and 2G each, and a pxb-pcie host bridge on node 1
+# with a hotplug Root Port rpn.
+NUMA2 = ["-object", "memory-backend-ram,id=m0,size=2G", "-object", "memory-backend-ram,id=m1,size=2G",
+         "-numa", "node,nodeid=0,cpus=0-3,memdev=m0", "-numa", "node,nodeid=1,cpus=4-7,memdev=m1",
+         "-device", "pxb-pcie,id=pxb1,bus_nr=64,numa_node=1,bus=pcie.0,addr=0x1c",
+         "-device", "pcie-root-port,id=rpn,bus=pxb1,chassis=60,slot=60"]
 # Jailhouse's CPUID signature: hypervisor_isolated_pci_functions() is true in
 # a -jh kernel (configs/jh.config).
 JAILHOUSE_CPU = "host,hv-relaxed,hv-vendor-id=Jailhouse"
@@ -85,6 +92,22 @@ SCN = {
                        post_extra=["-blockdev", "driver=null-co,node-name=nb1,size=67108864,read-zeroes=on",
                                    "-device", "virtio-blk-pci,id=vblk1,drive=nb1,bus=dp1"],
                        by_var={"bus": dict(rpsopts="hotplug=off"), "busio": dict(rpsopts="hotplug=off")}),
+    # vfio-pci NIC after fatal-error recovery: ep below rp1, sw below the switch
+    "vfiorec": dict(var="ep", timeout=150, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"],
+                    by_var={"sw": dict(nested=True, nestdevs="e1000e,-", qemu_extra=[])}),
+    # AER recovery with unbound devices, and with a driver without error handlers
+    "aerunb": dict(var="new", timeout=150, by_var={
+        "mf": dict(qemu_extra=["-device", "e1000e,id=nic2,bus=rp2,addr=0.0,multifunction=on",
+                               "-device", "e1000e,id=nic2f1,bus=rp2,addr=0.1"]),
+        "vfs": dict(qemu_extra=["-device", "igb,id=pf1,bus=rp2"]),
+        "nohandler": dict(qemu_extra=["-device", "qemu-xhci,id=xhci2,bus=rp2"])}),
+    # The TEST ONLY DPC emulation (pcitest/dpc_reset), with a NIC on rp1 at boot
+    "dpcwait": dict(var="dead", timeout=300, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"]),
+    # The igb PF is present at boot (no hot-add, so lockdep stays on).
+    "pmsriov": dict(a="10", timeout=300, qemu_extra=["-device", "igb,id=pf1,bus=rp1"]),
+    "sriovguard": dict(var="sysfs", timeout=200, qemu_extra=["-device", "igb,id=pf1,bus=rp1"]),
+    "numaprobe": dict(var="pciehp", append="igb.max_vfs=2", timeout=200, smp="8,sockets=2,cores=4,threads=1",
+                      qemu_extra=NUMA2, by_var={"rescan": dict(qemu_extra=NUMA2 + ["-device", "igb,id=pf1,bus=rpn"])}),
     # Slots without function 0 (Jailhouse signature, -jh kernels).  pcie_aspm=off
     # avoids N26 (and then needs pcie_ports=native: without ASPM support, _OSC
     # grants no native hotplug).  resume, boot-aspm: 01:00.1 alone at boot, in
@@ -116,7 +139,7 @@ SCN = {
 
 def defaults(scn, var):
     d = dict(n=2, var="x", a="", timeout=200, nested=False, nestdevs="e1000e,e1000e", rpsopts="", rpopts="",
-             qemu_extra=[], post_extra=[], append="", cpu="host", loglevel=7, lockdep_check=False,
+             qemu_extra=[], post_extra=[], append="", cpu="host", smp=None, loglevel=7, lockdep_check=False,
              shutdown_check=0)
     d.update({k: v for k, v in SCN.get(scn, {}).items() if k != "by_var"})
     v = var if var is not None else d["var"]
@@ -134,7 +157,8 @@ def main():
     ap.add_argument("--rpopts", help="pcie-root-port properties (replaces the scenario's)")
     ap.add_argument("--cpu", help="-cpu argument (replaces the scenario's)")
     ap.add_argument("--nested", action="store_true", default=None); ap.add_argument("--no-nested", dest="nested", action="store_false")
-    ap.add_argument("--loglevel", type=int); ap.add_argument("--smp", type=int, default=8); ap.add_argument("--mem", default="4G")
+    ap.add_argument("--loglevel", type=int); ap.add_argument("--smp", help="-smp argument (default 8)")
+    ap.add_argument("--mem", default="4G")
     ap.add_argument("--kasan", action="store_true", help="KASAN kernel: double the timeout")
     ap.add_argument("--qemu", default=os.environ.get("QEMU", os.path.join(ROOT, "out/qemu/qemu-system-x86_64")))
     ap.add_argument("--initrd", default=os.path.join(ROOT, "out/initramfs.cpio.gz"))
@@ -167,8 +191,9 @@ def main():
     if nrp > 28:
         sys.exit("at most 28 root ports")
     cpu = a.cpu if a.cpu is not None else d["cpu"]
+    smp = a.smp if a.smp is not None else (d["smp"] or "8")
     cmd = [a.qemu, "-M", "q35,kernel-irqchip=split", "-accel", "kvm", "-cpu", cpu,
-           "-smp", str(a.smp), "-m", a.mem, "-display", "none", "-vga", "none", "-no-reboot", "-nic", "none",
+           "-smp", smp, "-m", a.mem, "-display", "none", "-vga", "none", "-no-reboot", "-nic", "none",
            "-device", "intel-iommu,intremap=on,caching-mode=on",
            "-global", "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"]
     for i in range(1, nrp + 1):

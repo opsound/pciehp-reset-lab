@@ -11,12 +11,15 @@ usage()
 	cat >&2 <<EOF
 usage: $0 [all|build|test [OPTIONS] [SELECTION]]
        $0 fixes [--tree PATH[@REV] [--name NAME] [--patch FILE]] [TREE...] [OPTIONS] [SELECTION]
+       $0 checks [--tree PATH[@REV] [--name NAME] [--patch FILE]] [TREE...] [OPTIONS] [SELECTION]
   all     build the bug suite's kernels, QEMU and the initramfs, then run the
           bug suite on v7.4-rc1 (default)
   build   build only
   test    run the bug suite (scripts/run-tests.sh --help)
   fixes   build and run the fix tracking suite on the trees of
           configs/fix-trees.conf, on the named ones, or on a local tree
+  checks  run the series checks on v7.4-rc1, or build and run them on the
+          named trees or a local tree
 EOF
 	exit 2
 }
@@ -32,7 +35,7 @@ test)
 	shift
 	"${root}/scripts/run-tests.sh" "$@"
 	;;
-fixes)
+fixes|checks)
 	shift
 	trees=() opts=() tree_path="" name="" patch=""
 	while [ $# -gt 0 ]; do
@@ -61,14 +64,22 @@ fixes)
 		"${root}/scripts/build.sh" add-tree "${name}" "${tree_path}" "${rev}" ${patch:+"${patch}"}
 		trees+=("${name}")
 	fi
-	[ ${#trees[@]} -gt 0 ] || mapfile -t trees < <("${root}/scripts/build.sh" list-trees)
+	if [ "${action}" = fixes ] && [ ${#trees[@]} -eq 0 ]; then
+		mapfile -t trees < <("${root}/scripts/build.sh" list-trees)
+	fi
 	case " ${opts[*]} " in
 	*" --dry-run "*) ;;
-	*) make -C "${root}" -j"${JOBS:-$(nproc)}" fixes-build FIX_TREES="${trees[*]}" ;;
+	*)
+		if [ ${#trees[@]} -gt 0 ]; then
+			make -C "${root}" -j"${JOBS:-$(nproc)}" fixes-build FIX_TREES="${trees[*]}"
+		else
+			make -C "${root}" -j"${JOBS:-$(nproc)}" build
+		fi
+		;;
 	esac
 	targs=()
 	for t in "${trees[@]}"; do targs+=(--tree "${t}"); done
-	"${root}/scripts/run-tests.sh" --suite fixes "${targs[@]}" --jobs "${TEST_JOBS:-4}" "${opts[@]}"
+	"${root}/scripts/run-tests.sh" --suite "${action}" "${targs[@]}" --jobs "${TEST_JOBS:-4}" "${opts[@]}"
 	;;
 *)
 	usage

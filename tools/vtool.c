@@ -6,8 +6,11 @@
 //	relays a removal request for it.  --reset-on-req first issues VFIO_DEVICE_RESET
 //	on every other open device, like a live user resetting dev B while dev A is
 //	being removed.  SIGUSR1 closes all devices, last first; SIGUSR2 closes
-//	the first device only.  Devices in one IOMMU group (functions of one
-//	multifunction device) share the group fd.
+//	the first device only; SIGHUP prints a "VTPROBE" line per device
+//	(COMMAND read through vfio's config region, BAR0 + 8 through its BAR0
+//	region).  VT_CMD_OR=HEX sets those COMMAND bits through vfio after the
+//	open, as a user driver would.  Devices in one IOMMU group (functions of
+//	one multifunction device) share the group fd.
 //   vtool loop N BDF	   open and close the device fd N times (close resets)
 //   vtool resetloop N BDF  open once, VFIO_DEVICE_RESET N times
 //   vtool hotresetloop N BDF  open once, VFIO_DEVICE_PCI_HOT_RESET N times
@@ -41,6 +44,27 @@ static volatile sig_atomic_t do_close;
 static void on_usr1(int sig) { (void)sig; do_close = 1; }
 static volatile sig_atomic_t do_close1;
 static void on_usr2(int sig) { (void)sig; do_close1 = 1; }
+static volatile sig_atomic_t do_probe;
+static void on_hup(int sig) { (void)sig; do_probe = 1; }
+
+/* SIGHUP in hold: read COMMAND through the config region and the 32-bit
+ * register at BAR0 + 8 (e1000e STATUS) through the BAR0 region, as a user would. */
+static void probe(int i)
+{
+	struct vfio_region_info rc = { .argsz = sizeof(rc), .index = VFIO_PCI_CONFIG_REGION_INDEX };
+	struct vfio_region_info rb = { .argsz = sizeof(rb), .index = VFIO_PCI_BAR0_REGION_INDEX };
+	unsigned short c = 0;
+	unsigned int v = 0;
+	ssize_t n1 = -1, n2 = -1;
+
+	if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rc))
+		n1 = pread(devfd[i], &c, 2, rc.offset + 4);
+	if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rb))
+		n2 = pread(devfd[i], &v, 4, rb.offset + 8);
+	printf("VTPROBE %s vfio_cmd=%s0x%x bar0_reg8=%s0x%x\n", bdf[i], n1 == 2 ? "" : "ERR:", c,
+	       n2 == 4 ? "" : "ERR:", v);
+	fflush(stdout);
+}
 
 static double now(void)
 {
@@ -282,9 +306,26 @@ static int cmd_hold(int respond, int reset_on_req)
 		memcpy(s->data, &efd[i], sizeof(int));
 		if (ioctl(devfd[i], VFIO_DEVICE_SET_IRQS, s))
 			fprintf(stderr, "%s: REQ irq: %s (continuing)\n", bdf[i], strerror(errno));
+		/* VT_CMD_OR=HEX: set PCI_COMMAND bits through vfio's config region, as a user would */
+		if (getenv("VT_CMD_OR")) {
+			struct vfio_region_info ri = { .argsz = sizeof(ri), .index = VFIO_PCI_CONFIG_REGION_INDEX };
+			unsigned short c = 0, c2 = 0;
+
+			if (ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &ri) ||
+			    pread(devfd[i], &c, 2, ri.offset + 4) != 2) {
+				fprintf(stderr, "%s: config region: %s\n", bdf[i], strerror(errno));
+			} else {
+				c |= strtoul(getenv("VT_CMD_OR"), NULL, 16);
+				if (pwrite(devfd[i], &c, 2, ri.offset + 4) != 2)
+					fprintf(stderr, "%s: COMMAND write: %s\n", bdf[i], strerror(errno));
+				pread(devfd[i], &c2, 2, ri.offset + 4);
+				printf("VTCMD %s wrote=0x%x reads=0x%x\n", bdf[i], c, c2);
+			}
+		}
 	}
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);
+	signal(SIGHUP, on_hup);
 	printf("READY pid=%d\n", getpid());
 	fflush(stdout);
 	while ((respond || reset_on_req) && !do_close) {
@@ -330,6 +371,12 @@ static int cmd_hold(int respond, int reset_on_req)
 	}
 	while (!do_close) {
 		pause();
+		if (do_probe) {
+			do_probe = 0;
+			for (i = 0; i < ndev; i++)
+				if (devfd[i] >= 0)
+					probe(i);
+		}
 		if (do_close1 && devfd[0] >= 0) {
 			close(devfd[0]);
 			devfd[0] = -1;
