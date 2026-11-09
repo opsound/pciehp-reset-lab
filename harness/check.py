@@ -21,6 +21,10 @@
 import json, re, sys
 
 FAILWORDS = ("FAIL", "HUNG", "HANG", "STUCK", "KASAN")
+# "stuck", "hung" or "hang" in the scenario's result, as a word or a key with a
+# value ("stuck=pciehp"), but not negated ("no hang", "not stuck") or zero
+# ("hung=0", "stuck=none")
+HANGWORD = re.compile(r"(?<!\bno )(?<!\bnot )\b(stuck|hung|hang)\b(?!=(?:0|none)\b)", re.I)
 
 
 def symptoms(rec):
@@ -32,9 +36,7 @@ def symptoms(rec):
     # a symptom of the kernel.
     if not rec.get("ready"):
         return ["error"]
-    # "stuck", "hung" or "hang" in the result, but not a zero count like "hung=0"
-    if (rec.get("verdict") == "HANG" or rec.get("hung_tasks") or rec.get("timed_out")
-            or re.search(r"\b(stuck|hung|hang)\b(?!=0\b)", res, re.I)):
+    if rec.get("verdict") == "HANG" or rec.get("hung_tasks") or rec.get("timed_out") or HANGWORD.search(res):
         s.append("hang")
     if rec.get("lockdep"):
         s.append("lockdep")
