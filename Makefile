@@ -2,11 +2,12 @@
 	qemu busybox tools initramfs
 
 # The bug suite: v7.4-rc1, as is and with the TEST ONLY hooks patch.
-BUG_KERNELS := mainline mainline-kasan mainline-hooks mainline-hooks-kasan mainline-hooks-hc
+BUG_KERNELS := mainline mainline-kasan mainline-hooks mainline-hooks-kasan mainline-hooks-hc \
+	mainline-hooks-jh
 # Fix tracking: the trees of configs/fix-trees.conf (or FIX_TREES=...), each
 # with the hooks patch.
 FIX_TREES ?= $(shell ./scripts/build.sh list-trees)
-FIX_KERNELS := $(foreach t,$(FIX_TREES),$(t)-hooks $(t)-hooks-kasan $(t)-hooks-hc)
+FIX_KERNELS := $(foreach t,$(FIX_TREES),$(t)-hooks $(t)-hooks-kasan $(t)-hooks-hc $(t)-hooks-jh)
 # Ninja cannot join make's jobserver, so QEMU takes a fixed slice on top
 # of the shared pool.  Overridable: make build QEMU_JOBS=16.
 QEMU_JOBS ?= 8

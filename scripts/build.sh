@@ -20,9 +20,10 @@ local_trees_conf="${out}/local-trees.conf"
 busybox_src="${out}/src/busybox-${BUSYBOX_VERSION}"
 
 # The bug suite's kernels: v7.4-rc1 as is, and with the TEST ONLY hooks patch.
-BUG_KERNELS="mainline mainline-kasan mainline-hooks mainline-hooks-kasan mainline-hooks-hc"
-# Every fix tree is built as <tree>-hooks, <tree>-hooks-kasan, <tree>-hooks-hc.
-FLAVORS="hooks hooks-kasan hooks-hc"
+BUG_KERNELS="mainline mainline-kasan mainline-hooks mainline-hooks-kasan mainline-hooks-hc mainline-hooks-jh"
+# Every fix tree is built as <tree>-hooks, <tree>-hooks-kasan, <tree>-hooks-hc,
+# <tree>-hooks-jh.
+FLAVORS="hooks hooks-kasan hooks-hc hooks-jh"
 # Static guest helpers, tools/<name>.c
 GUEST_TOOLS="vtool wloop cf1 aerinj"
 
@@ -231,7 +232,7 @@ kernel_source() # name
 {
 	case "$1" in
 	mainline|mainline-kasan) echo "${linux_src}" ;;
-	*-hooks|*-hooks-kasan|*-hooks-hc) echo "${out}/src/${1%-hooks*}-hooks" ;;
+	*-hooks|*-hooks-kasan|*-hooks-hc|*-hooks-jh) echo "${out}/src/${1%-hooks*}-hooks" ;;
 	*) echo "unknown kernel: $1" >&2; exit 2 ;;
 	esac
 }
@@ -248,6 +249,7 @@ build_one_kernel() # name
 	case "${name}" in
 	*-kasan) frag="${root}/configs/kasan.config" ;;
 	*-hc) frag="${root}/configs/hc.config" ;;
+	*-jh) frag="${root}/configs/jh.config" ;;
 	esac
 	if [ -n "${frag}" ]; then
 		"${source}/scripts/kconfig/merge_config.sh" -m -O "${build}" \
