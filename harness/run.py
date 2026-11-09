@@ -6,7 +6,7 @@
 # summary, dmesg), host.txt, summary.txt and result.json to <outdir>.
 #
 # Usage: run.py <bzImage> <scenario> <outdir> [--var V] [--n N] [--a A]
-#               [--timeout S] [--kasan] [--qemu PATH] [--initrd F]
+#               [--timeout S] [--kasan] [--cpu CPU] [--qemu PATH] [--initrd F]
 # Per-scenario defaults (SCN below) supply var, n, timeout, kernel arguments and
 # topology, per variant where by_var says so.
 #
@@ -15,10 +15,10 @@
 # x3130 switch (up1) and two hotplug downstream ports dp1/dp2 carrying the
 # devices of nestdevs ("DEV1,DEV2": "-" for an empty slot, drivers joined by
 # "+" for the functions of a multifunction device; default e1000e nicd1/nicd2),
-# plus qemu_extra devices.  Hot-added devices come from the guest's @@ACT
-# requests (e1000e by default, igb for SR-IOV).  The guest sends @@ACT lines on ttyS1
-# (guest.log), which only it writes to, so kernel messages on ttyS0 can't
-# corrupt them; only complete lines are executed.
+# plus qemu_extra devices (post_extra after the switch).  Hot-added devices
+# come from the guest's @@ACT requests (e1000e by default, igb for SR-IOV).  The
+# guest sends @@ACT lines on ttyS1 (guest.log), which only it writes to, so
+# kernel messages on ttyS0 can't corrupt them; only complete lines are executed.
 import argparse, json, os, re, shutil, socket, subprocess, sys, tempfile, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -30,14 +30,18 @@ import qxparse  # noqa: E402
 # variant, a: rounds/seconds, timeout: host-side limit in s, nested: switch
 # topology, nestdevs: devices below the switch, rpsopts: extra properties of
 # the switch's root port, rpopts: extra properties of rp1..rpN, qemu_extra:
-# more -device arguments, append: extra kernel args, lockdep_check: a lockdep
-# report fails the run, shutdown_check: seconds to wait for the poweroff after
-# the guest is done (its result depends on it: qxparse "CHECK: poweroff"),
-# by_var: per-variant overrides.
+# more -device arguments, post_extra: -device arguments that need the switch's
+# ports, append: extra kernel args, cpu: -cpu, lockdep_check: a lockdep report
+# fails the run, shutdown_check: seconds to wait for the poweroff after the
+# guest is done (its result depends on it: qxparse "CHECK: poweroff"), by_var:
+# per-variant overrides.
 PCP_OFF = "power_controller_present=off"
 # A Root Port without a hotplug slot, with an igb PF present at boot.
 RPC_IGB = ["-device", "pcie-root-port,id=rpc,bus=pcie.0,chassis=50,slot=50,addr=0x1d,hotplug=off",
            "-device", "igb,id=pf1,bus=rpc"]
+# Jailhouse's CPUID signature: hypervisor_isolated_pci_functions() is true in
+# a -jh kernel (configs/jh.config).
+JAILHOUSE_CPU = "host,hv-relaxed,hv-vendor-id=Jailhouse"
 SCN = {
     "deadlock": dict(var="exit", timeout=150),
     "sysfsrm": dict(var="del", timeout=150),
@@ -76,6 +80,21 @@ SCN = {
     "vfstall": dict(var="pciehp", timeout=200),
     "bindremove": dict(nested=True, var="sysfs", timeout=200),
     "aermsix": dict(timeout=150),
+    # virtio-blk (null backend) below dp1, after the switch: post_extra
+    "resetorder": dict(nested=True, nestdevs="-,e1000e", var="io", a="3", timeout=200,
+                       post_extra=["-blockdev", "driver=null-co,node-name=nb1,size=67108864,read-zeroes=on",
+                                   "-device", "virtio-blk-pci,id=vblk1,drive=nb1,bus=dp1"],
+                       by_var={"bus": dict(rpsopts="hotplug=off"), "busio": dict(rpsopts="hotplug=off")}),
+    # Slots without function 0 (Jailhouse signature, -jh kernels).  pcie_aspm=off
+    # avoids N26 (and then needs pcie_ports=native: without ASPM support, _OSC
+    # grants no native hotplug).  resume, boot-aspm: 01:00.1 alone at boot, in
+    # a slot without power controller (QEMU powers a slot with one off at
+    # reset, so the boot scan finds nothing), which also keeps the card through
+    # pciehp's teardown.
+    "isolfn": dict(var="vanish", timeout=150, cpu=JAILHOUSE_CPU, append="pcie_aspm=off pcie_ports=native",
+                   by_var={"vanish-aspm": dict(append=""),
+                           "resume": dict(rpopts=PCP_OFF, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1,addr=0.1"]),
+                           "boot-aspm": dict(append="", rpopts=PCP_OFF, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1,addr=0.1"])}),
     "rpmsafe": dict(var="rpm", rpopts=PCP_OFF, append="pcie_port_pm=force", timeout=120),
     "linkdownadd": dict(timeout=120),
     "pfprobe": dict(append="igb.max_vfs=2", timeout=150),
@@ -97,7 +116,8 @@ SCN = {
 
 def defaults(scn, var):
     d = dict(n=2, var="x", a="", timeout=200, nested=False, nestdevs="e1000e,e1000e", rpsopts="", rpopts="",
-             qemu_extra=[], append="", loglevel=7, lockdep_check=False, shutdown_check=0)
+             qemu_extra=[], post_extra=[], append="", cpu="host", loglevel=7, lockdep_check=False,
+             shutdown_check=0)
     d.update({k: v for k, v in SCN.get(scn, {}).items() if k != "by_var"})
     v = var if var is not None else d["var"]
     d.update(SCN.get(scn, {}).get("by_var", {}).get(v, {}))
@@ -112,6 +132,7 @@ def main():
     ap.add_argument("--a", help="a= for the guest (rounds or seconds)")
     ap.add_argument("--append", help="extra kernel arguments (added to the scenario's)")
     ap.add_argument("--rpopts", help="pcie-root-port properties (replaces the scenario's)")
+    ap.add_argument("--cpu", help="-cpu argument (replaces the scenario's)")
     ap.add_argument("--nested", action="store_true", default=None); ap.add_argument("--no-nested", dest="nested", action="store_false")
     ap.add_argument("--loglevel", type=int); ap.add_argument("--smp", type=int, default=8); ap.add_argument("--mem", default="4G")
     ap.add_argument("--kasan", action="store_true", help="KASAN kernel: double the timeout")
@@ -145,7 +166,8 @@ def main():
     nrp = max(n, 2)
     if nrp > 28:
         sys.exit("at most 28 root ports")
-    cmd = [a.qemu, "-M", "q35,kernel-irqchip=split", "-accel", "kvm", "-cpu", "host",
+    cpu = a.cpu if a.cpu is not None else d["cpu"]
+    cmd = [a.qemu, "-M", "q35,kernel-irqchip=split", "-accel", "kvm", "-cpu", cpu,
            "-smp", str(a.smp), "-m", a.mem, "-display", "none", "-vga", "none", "-no-reboot", "-nic", "none",
            "-device", "intel-iommu,intremap=on,caching-mode=on",
            "-global", "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"]
@@ -170,6 +192,7 @@ def main():
                 else:
                     cmd += ["-device", "%s,id=nicd%d%s,bus=dp%d,addr=0.%d%s" % (
                         drv, i, "f%d" % fn if fn else "", i, fn, ",multifunction=on" if fn == 0 else "")]
+    cmd += list(d["post_extra"])
     av = a.a if a.a is not None else d["a"]
     cmdline = "console=ttyS0 intel_iommu=on panic=-1 loglevel=%d log_buf_len=8M printk.devkmsg=on scn=%s var=%s n=%d%s %s" % (
         loglevel, a.scn, d["var"], n, (" a=%s" % av) if av else "", append)

@@ -26,7 +26,8 @@ EOF
 # Tests: "name issues flavor scenario var rounds expectation runs fixruns".
 #   flavor   kernel build: plain (v7.4-rc1 as is), kasan, hooks (with
 #            patches/test-hooks.patch), hooks-kasan, hooks-hc (hooks plus
-#            configs/hc.config: pci-host-common built in)
+#            configs/hc.config: pci-host-common built in), hooks-jh (hooks
+#            plus configs/jh.config: Jailhouse guest support)
 #   scenario guest/scn/<scenario>.sh; var and rounds ("-": the default of
 #            harness/run.py) are passed to it as var= and a=
 #   expectation  the symptom the test shows on v7.4-rc1: hang, lockdep,
@@ -79,6 +80,10 @@ TESTS=(
 	"removal-stall N22 plain vfstall pciehp - fail 1 2"
 	"bind-during-removal N23 plain bindremove sysfs - fail 1 2"
 	"shutdown-aer-deadlock N24 plain shutaer slot 10 hang 1 2"
+	"reset-prepare-order N25 plain resetorder io 3 hang 1 2"
+	"isolated-fn-aspm-oops N26 hooks-jh isolfn vanish-aspm - oops 1 2"
+	"isolated-fn-resume-removal N27 hooks-jh isolfn resume - fail 1 2"
+	"hotadd-fn0-vanish N27 hooks-jh isolfn vanish - oops 1 2"
 )
 # Fix tracking only: regressions that fix attempts introduced, not bugs of
 # v7.4-rc1.  "name - flavor scenario var rounds - - fixruns"
