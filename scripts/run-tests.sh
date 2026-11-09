@@ -52,6 +52,7 @@ TESTS=(
 	"bus-reset-removal-uaf N4 hooks-kasan busuaf plain 20 lockdep 2 4"
 	"reset-adding-device N5 hooks addwin win - hang 1 1"
 	"pciehp-unbind-uaf N6 kasan svcunbind fn 20 kasan 1 1"
+	"pciehp-unbind-hot-reset-uaf N6 kasan svcunbind hot 20 kasan 2 2"
 	"reset-pciehp-unbind N6,N8 hooks lifetime - - hang 1 1"
 	"reset-before-bind N7 hooks window2 hold - fail 1 1"
 	"reset-after-scan N7 hooks scanwin post - fail 8 2"

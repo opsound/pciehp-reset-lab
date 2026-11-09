@@ -110,6 +110,7 @@ test). "v7.4-rc1" is the symptom the test expects there.
 | `bus-reset-removal-uaf` | 2, KASAN | N4 | lockdep | AER-style resets of a Root Port without a hotplug slot in a loop (`pci_bus_reset()`) while the switch below it is removed through sysfs; the first round leaks a device lock taken in `__pci_bus_lock()` |
 | `reset-adding-device` | 2 | N5 | hang | `reset_subordinate` between `list_add_tail()` and `device_add()` of a hot-added NIC |
 | `pciehp-unbind-uaf` | 1, KASAN | N6 | kasan | sysfs reset with reset_method=bus while the pciehp service unbinds and rebinds |
+| `pciehp-unbind-hot-reset-uaf` | 1, KASAN | N6 | kasan | the same with VFIO_DEVICE_PCI_HOT_RESET of a vfio-pci NIC in a loop: `pci_reset_bus()` -> `pci_try_reset_slot()`, which also uses the `struct pci_slot` |
 | `reset-pciehp-unbind` | 2 | N6, N8 | hang | AER-style reset of a Root Port while pcieport unbinds from it |
 | `reset-before-bind` | 2 | N7 | fail | `->reset_slot()` while pciehp waits for a contended pci_rescan_remove_lock; the NIC ends up unbound with BAR0 lost |
 | `reset-after-scan` | 2 | N7 | fail | `reset_subordinate` right after pciehp scanned a hot-added NIC; its driver fails to probe in some runs |
@@ -219,7 +220,7 @@ boot.
 
 The tests added on 2026-11-09, and `sriov-disable-deadlock` after its setup
 and timing fixes, from a fresh clone that day (`./run test --all-runs --runs 3
-TEST`):
+TEST`; 4 runs for `pciehp-unbind-hot-reset-uaf`, added later):
 
 | test | v7.4-rc1 |
 |---|---|
@@ -227,6 +228,7 @@ TEST`):
 | `vfio-reset-surprise` | hang in 3/3 (also fail, lockdep) |
 | `sriov-disable-deadlock` | hang in 3/3 (also fail, lockdep) |
 | `bus-reset-removal-uaf` | lockdep in 3/3 (also fail) |
+| `pciehp-unbind-hot-reset-uaf` | kasan in 4/4 (also fail, lockdep) |
 | `nested-surprise-removal` | hang in 3/3 (also fail) |
 | `reset-prepare-order` | hang in 3/3 (also fail) |
 | `isolated-fn-aspm-oops` | oops in 3/3 (also fail) |
@@ -290,8 +292,9 @@ instead of N3, and `pciehp-rpm-safe-removal` and `pf-probe-sriov-removal` show
 N18's lockdep report and N21's warning, not regressions. Of the eight tests
 added since (run on 2026-11-09), it is clean on `vfio-exit-surprise`,
 `vfio-reset-surprise`, `bus-reset-removal-uaf`, `nested-surprise-removal` and
-`hotadd-fn0-vanish`, so 24 of 51 entries. Results per test and status per
-issue: [docs/fix-status.md](docs/fix-status.md).
+`hotadd-fn0-vanish`, and on `pciehp-unbind-hot-reset-uaf`, added later, so 25
+of 52 entries. Results per test and status per issue:
+[docs/fix-status.md](docs/fix-status.md).
 
 ## Series checks
 

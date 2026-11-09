@@ -622,7 +622,11 @@ v7.4-rc1. Earlier versions of this catalog called N11-N14 R1-R5
   hot reset, races unbinding of the pciehp service or the port driver.
 - Lab: `pciehp-unbind-uaf` (exact mainline, KASAN: sysfs reset with reset_method=bus while the pciehp
   service is unbound and rebound in a loop): "slab-use-after-free in up_write <- pciehp_reset_slot",
-  freed by unbind_store, on mainline. `reset-pciehp-unbind` (hooks: an AER-style reset of the port while
+  freed by unbind_store, on mainline. `pciehp-unbind-hot-reset-uaf` (exact mainline, KASAN: the same
+  with VFIO_DEVICE_PCI_HOT_RESET of a vfio-pci NIC in a loop, i.e. pci_reset_bus() ->
+  pci_try_reset_slot(), which also uses the struct pci_slot that the unbind frees): the same report on
+  mainline (4 of 4 runs). With only the controller's lifetime fixed, the report moves to the struct
+  pci_slot in pci_try_reset_slot(). `reset-pciehp-unbind` (hooks: an AER-style reset of the port while
   pcieport unbinds from it) hangs on mainline on N8.
 - Earlier reports: E2 (Lukas 2020: "We've never done this correctly."), E3 (Lukas on slot->hotplug
   safety).
@@ -1315,7 +1319,7 @@ Maintainer positions from earlier threads:
 | N3 | pci_get_slot() under reset_lock in pciehp_ignore_link_change() | none | none | spurious-link-lookup-deadlock |
 | N4 | reset walks of bus->devices vs removal or addition (UAF, GPF, leaked lock, unbalanced unlock) | E21, E25 | W4 | reset-removal-uaf (slot path), bus-reset-removal-uaf (bus path); reset-holds-probing (unbalanced unlock) |
 | N5 | resets lock devices not yet device_add()ed | none | none | reset-adding-device |
-| N6 | ->reset_slot() in flight during hotplug driver unbind (UAF) | E2, E3 (maintainer remarks) | none | pciehp-unbind-uaf, reset-pciehp-unbind |
+| N6 | ->reset_slot() in flight during hotplug driver unbind (UAF) | E2, E3 (maintainer remarks) | none | pciehp-unbind-uaf, pciehp-unbind-hot-reset-uaf, reset-pciehp-unbind |
 | N7 | queued slot reset hits devices while drivers bind | none (W4 notes the window) | W4 (limitation) | reset-before-bind, reset-after-scan |
 | N8 | pci_slot_mutex held across slot resets | E3 (2/2), E11, E24 | W1 (partial) | reset-storm, reset-during-bind, slot-mutex-lockdep, aer-hotadd-race, reset-pciehp-unbind |
 | N9 | remove_store() UAF after device_remove_file_self() | E9, E10 (8/8) | W2 2/5 touches the same code | sysfs-remove-uaf |

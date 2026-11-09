@@ -41,7 +41,8 @@ and `reset-holds-removing` (2/3). The eight tests added on 2026-11-09 (`vfio-exi
 `vfio-reset-surprise`, `bus-reset-removal-uaf`, `nested-surprise-removal`, `reset-prepare-order`,
 `isolated-fn-aspm-oops`, `isolated-fn-resume-removal`, `hotadd-fn0-vanish`) and the changed
 `sriov-disable-deadlock` were run on the series in a fresh clone that day, with the hooks patch
-that adds their knobs: 5 of the 8 are clean, so 24 of 51 entries.
+that adds their knobs: 5 of the 8 are clean, so 24 of 51 entries. `pciehp-unbind-hot-reset-uaf`,
+added later that day, is clean in 3/3 runs: 25 of 52 entries.
 
 | test | issue | result on the series |
 |---|---|---|
@@ -59,6 +60,7 @@ that adds their knobs: 5 of the 8 are clean, so 24 of 51 entries.
 | `bus-reset-removal-uaf` | N4 | clean (4/4) |
 | `reset-adding-device` | N5 | clean (1/1) |
 | `pciehp-unbind-uaf` | N6 | clean (1/1) |
+| `pciehp-unbind-hot-reset-uaf` | N6 | clean (3/3) |
 | `reset-pciehp-unbind` | N6, N8 | clean (1/1) |
 | `reset-before-bind` | N7 | clean (1/1) |
 | `reset-after-scan` | N7 | clean (2/2) |
@@ -110,7 +112,7 @@ tracking run above.
 | N3 | pci_get_slot() under reset_lock | 4 (not the enumeration variant) | spurious-link-lookup-deadlock | not fixed: the test deadlocks through N11 instead |
 | N4 | reset walks vs removal or addition | 5, 9 | reset-removal-uaf, bus-reset-removal-uaf | fixed |
 | N5 | resets lock devices not yet added | 6 | reset-adding-device | fixed |
-| N6 | ->reset_slot() vs hotplug driver unbind | 7 | pciehp-unbind-uaf, reset-pciehp-unbind | fixed |
+| N6 | ->reset_slot() vs hotplug driver unbind | 7 | pciehp-unbind-uaf, pciehp-unbind-hot-reset-uaf, reset-pciehp-unbind | fixed |
 | N7 | queued slot reset vs driver binding | 10, 9, 3 | reset-before-bind, reset-after-scan | fixed |
 | N8 | pci_slot_mutex across slot resets | 8 | reset-storm, reset-during-bind, slot-mutex-lockdep, aer-hotadd-race, reset-pciehp-unbind | fixed (`aer-hotadd-race` then shows N12) |
 | N9 | remove_store() UAF | 11 | sysfs-remove-uaf | fixed |
@@ -146,7 +148,9 @@ From code review and the commit messages:
   (the variant in the catalog).
 - N4: pci_slot_resettable() and pci_bus_resettable() still walk bus->devices without pci_bus_sem.
 - N6: commit 7 covers callers that keep the pci_slot allocated: pci_reset_bridge(), and
-  pci_reset_bus() from commit 9 on. pci_dev_reset_slot_function() still reads dev->slot without a
+  pci_reset_bus() from commit 9 on. With commit 7 ported alone to v7.4-rc1,
+  `pciehp-unbind-hot-reset-uaf` (pci_reset_bus()) reports a use-after-free of the struct pci_slot in
+  pci_try_reset_slot() (3 of 3 runs). pci_dev_reset_slot_function() still reads dev->slot without a
   reference (narrow window).
 - N7: with commit 8, other enumerators (e.g. a sysfs rescan) can add devices to a slot during an
   error-recovery slot reset, which then hits them; they used to wait on pci_slot_mutex in
