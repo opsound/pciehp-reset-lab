@@ -7,11 +7,11 @@ The first of them hung production hosts whose hot-pluggable devices were bound
 to vfio-pci.
 
 [docs/catalog.md](docs/catalog.md) catalogs the issues: the production
-deadlock (P0), the issues found while testing or by review (N1-N24), earlier
+deadlock (P0), the issues found while testing or by review (N1-N27), earlier
 upstream reports of each (E0-E36), and related in-flight work and RFCs
 (W1-W12). Earlier versions called N11-N14 R1-R5.
 
-The lab has two suites:
+The lab has two suites, plus checks for posted series:
 
 - **The bug suite** runs every test on v7.4-rc1 and expects the symptom of
   its bug. This is what `./run` does.
@@ -19,6 +19,11 @@ The lab has two suites:
   attempts, on fix trees and expects every run to be clean. It has its own
   section, [Fix tracking](#fix-tracking), and status file,
   [docs/fix-status.md](docs/fix-status.md).
+- **Series checks** test what posted series claim to fix outside the catalog,
+  and regressions that posted series introduced. `./run checks` runs them on
+  v7.4-rc1, expecting each check's v7.4-rc1 result; on a tree under test they
+  have to pass. See [Series checks](#series-checks); the results of posted
+  series are in [docs/fix-status.md](docs/fix-status.md#posted-series).
 
 ## One-command run
 
@@ -31,7 +36,7 @@ cd pciehp-reset-lab
 `./run` builds Linux, QEMU, a static busybox, static helper programs and an
 initramfs, then runs the bug suite. Build products and serial logs go to
 `out/`. Each result line names its serial log under `out/logs/`. The first
-build is large (five kernels); later builds are incremental.
+build is large (six kernels); later builds are incremental.
 
 The host needs a C compiler and static libc development files, GNU make,
 binutils, flex, bison, bc, OpenSSL and ELF development files, Python 3, Meson,
@@ -49,6 +54,8 @@ Narrower commands:
 ./run test --runs 5 nested-removal  # override the number of runs
 ./run test --all-runs all           # every run, also after the symptom showed
 ./run test --jobs 8 all             # guests in parallel (default 1; ./run uses 4)
+./run checks                        # the series checks on v7.4-rc1
+./run checks --tree ~/linux@my-fix aer-unbound   # one check on a local tree
 ```
 
 ## Kernels
@@ -58,6 +65,7 @@ Narrower commands:
 | `mainline` | v7.4-rc1 (6628e7d4c6b2) |
 | `mainline-hooks` | v7.4-rc1 + `patches/test-hooks.patch` (TEST ONLY) |
 | `mainline-hooks-hc` | the same, with `configs/hc.config` (`CONFIG_OF`, `CONFIG_PCI_HOST_GENERIC`) |
+| `mainline-hooks-jh` | the same, with `configs/jh.config` (`CONFIG_JAILHOUSE_GUEST`) |
 
 `mainline` and `mainline-hooks` also build as `-kasan` with
 `configs/kasan.config` (generic inline KASAN, `SLUB_DEBUG_ON`). All use
@@ -73,6 +81,13 @@ after a Secondary Bus Reset, and delays that widen windows in pciehp,
 `pci_device_add()` and probe. The hooks are inert until written to.
 `link_down` exists only in the `-hc` kernels: it runs the real
 pci-host-common link-down recovery, which q35 can't reach otherwise.
+`dpc_reset` emulates DPC recovery, as QEMU's Root Ports have no DPC.
+
+"jh" tests run on `mainline-hooks-jh` with Jailhouse's CPUID signature in the
+guest (`-cpu host,hv-vendor-id=Jailhouse`), so that
+`hypervisor_isolated_pci_functions()` is true and slots without function 0
+get scanned, as on s390, LoongArch and Jailhouse. Without that signature the
+option is inert.
 
 ## Tests
 
@@ -83,13 +98,16 @@ test). "v7.4-rc1" is the symptom the test expects there.
 |---|---|---|---|---|
 | `vfio-exit-deadlock` | 1 | P0 | hang | two vfio-pci NICs below two Root Ports, held by one process; both are safely removed 2 s apart and the process is killed |
 | `vfio-reset-deadlock` | 1 | P0 | hang | same, but the process answers the removal request with VFIO_DEVICE_RESET of the other device |
+| `vfio-exit-surprise` | 1 | P0 | hang | `vfio-exit-deadlock` with surprise removal of both NICs (detached through their Root Ports' Slot Control, marked disconnected by pciehp) and their default reset methods |
+| `vfio-reset-surprise` | 1 | P0 | hang | `vfio-reset-deadlock` with the same surprise removal |
 | `sysfs-remove-deadlock` | 1 | P0 | hang | sysfs "remove" holds pci_rescan_remove_lock while vfio-pci waits for the process; the second slot is removed with the Attention Button |
 | `sriov-disable-deadlock` | 1 | P0 | hang | `sriov_numvfs=0` on an igb PF holds pci_rescan_remove_lock while a VF is held through vfio-pci |
 | `hotadd-lockdep` | 1 | N1 | lockdep | one hot-add, safe removal and re-add |
 | `nested-lockdep` | 1 | N1 | lockdep | sysfs rescan of a switch with hotplug Downstream Ports, then hot-plug below one of them |
 | `host-reset-deadlock` | 2 | N2 | hang | emulated `pci_host_reset_root_port()` while pciehp hot-adds a NIC |
 | `spurious-link-lookup-deadlock` | 2 | N3 | hang | a recovery walk parked on a vfio-pci function, a queued pci_bus_sem writer, the link change a real port reports after a slot reset (hook), then a slot reset with the device locks held |
-| `reset-removal-uaf` | 2, KASAN | N4 | kasan | AER-style resets of two Root Ports in loops while pciehp tears down a vfio-pci NIC below one |
+| `reset-removal-uaf` | 2, KASAN | N4 | kasan | AER-style resets of two hotplug Root Ports in loops (slot resets) while pciehp tears down a vfio-pci NIC below one |
+| `bus-reset-removal-uaf` | 2, KASAN | N4 | lockdep | AER-style resets of a Root Port without a hotplug slot in a loop (`pci_bus_reset()`) while the switch below it is removed through sysfs; the first round leaks a device lock taken in `__pci_bus_lock()` |
 | `reset-adding-device` | 2 | N5 | hang | `reset_subordinate` between `list_add_tail()` and `device_add()` of a hot-added NIC |
 | `pciehp-unbind-uaf` | 1, KASAN | N6 | kasan | sysfs reset with reset_method=bus while the pciehp service unbinds and rebinds |
 | `reset-pciehp-unbind` | 2 | N6, N8 | hang | AER-style reset of a Root Port while pcieport unbinds from it |
@@ -101,6 +119,7 @@ test). "v7.4-rc1" is the symptom the test expects there.
 | `aer-hotadd-race` | 2 | N8, N12 | hang | `pcie_do_recovery()` of a Root Port while pciehp hot-adds a NIC; hangs on N8 before it can show N12 |
 | `sysfs-remove-uaf` | 1, KASAN | N9 | kasan | sysfs "remove" of a NIC racing slot power-off |
 | `nested-removal` | 1 | N10 | hang | removal of a NIC below a switch Downstream Port and of the switch at nearly the same time; hangs in some runs |
+| `nested-surprise-removal` | 2 | N10 | hang | a NIC below a switch Downstream Port is surprise-removed, and its pciehp is held between the slot check and pci_rescan_remove_lock (delay knob) while the Root Port's pciehp surprise-removes the switch after a link change (hook) |
 | `nested-bringup-deadlock` | 2 | N10 | hang | a NIC hot-added on an empty Downstream Port while the sysfs remover of the switch waits for pci_rescan_remove_lock, held by a hook |
 | `port-unbind-deadlock` | 2 | N10 | hang | sysfs unbind of a Downstream Port's pcieport driver while its pciehp waits for pci_rescan_remove_lock, held by a remover of the switch that waits for the port |
 | `port-unbind-host-reset` | 2 | N10 | hang | the same with an emulated `pci_host_reset_root_port()` as the lock holder |
@@ -111,7 +130,7 @@ test). "v7.4-rc1" is the symptom the test expects there.
 | `sriov-pciehp-abba` | 2 | N13 | hang | the same with pciehp removing the PF |
 | `dead-link-reset-wait` | 1 | N14 | fail | a slot reset of a NIC that stopped answering while its link stays up, surprise-removed 5 s in; the reset must return within 5 s of the removal |
 | `reset-holds-removing` | 2 | N15 | hang | `pci_bus_error_reset()` of a Root Port locks a NIC that pciehp is about to remove, then waits for an igb PF that `sriov_numvfs` holds |
-| `reset-holds-probing` | 2 | N16 | hang | `pci_bus_error_reset()` of a Root Port locks a NIC whose first probe a rescan is about to run, then waits for an igb PF that `sriov_numvfs` holds |
+| `reset-holds-probing` | 2 | N16 | hang | `pci_bus_error_reset()` of a Root Port locks a NIC whose first probe a rescan is about to run, then waits for an igb PF that `sriov_numvfs` holds; runs that don't hang can show N4's unbalanced unlock of VFs added during the reset |
 | `reset-subordinate-uaf` | 1, KASAN | N17 | kasan | `reset_subordinate` of a Downstream Port in loops while the switch is removed through sysfs |
 | `pciehp-rpm-recursion` | 2 | N18 | hang | slot resets in a loop while a sysfs power write disables the slot of a runtime-suspended Root Port |
 | `rescan-remove-deadlock` | 1 | N19 | hang | a loop writing a NIC's "rescan" attribute while the switch above it is removed through sysfs |
@@ -121,12 +140,19 @@ test). "v7.4-rc1" is the symptom the test expects there.
 | `removal-stall` | 1 | N22 | fail | a rescan of an empty Root Port while pciehp's removal of a vfio-pci NIC waits for its holder; it must return within 4 s |
 | `bind-during-removal` | 1 | N23 | fail | e1000e is bound to a NIC below a switch whose sysfs removal waits for a vfio-pci holder; the bind must fail |
 | `shutdown-aer-deadlock` | 1 | N24 | hang | fatal AER errors injected every 10 ms through `/dev/aer_inject` into a poweroff |
+| `reset-prepare-order` | 1 | N25 | hang | `reset_subordinate` of a Root Port above a switch with a virtio-blk below it, while the disk is read |
+| `isolated-fn-aspm-oops` | 2, jh | N26 | oops | a two-function e1000e hot-added while a knob hides function 0 after the link check; ASPM on |
+| `isolated-fn-resume-removal` | 2, jh | N27 | fail | function 1 of an e1000e alone at boot, then s2idle (`pm_test=platform`); the slot must survive the resume (uses no hook) |
+| `hotadd-fn0-vanish` | 2, jh | N27 | oops | `isolated-fn-aspm-oops` with `pcie_aspm=off`: the DSN read of the missing function 0 |
 
 Expectations: `hang` (no completion, hung tasks, or a stuck operation),
 `lockdep` (a lockdep report), `kasan` (a KASAN report), `oops` (another BUG or
 oops), `warn` (a WARNING other than lockdep's), `fail` (the scenario's own
 check failed, e.g. a hot-added device without its driver or with BAR0
-cleared, or an operation that took too long), `clean` (none of these). A run
+cleared, or an operation that took too long), `clean` (none of these), `pass`
+(series checks only: the scenario's check passed with no hang, oops or KASAN
+report; lockdep reports and warnings are allowed, as v7.4-rc1 shows N1's on
+the first hot-add). A run
 whose guest never booted counts as a harness error, never as a symptom. In
 the bug suite an entry passes once a run shows its symptom; `--all-runs` makes
 it do every run, to measure the rate.
@@ -191,6 +217,29 @@ which is why the bug suite now allows them 16, 12 and 8 runs (the table's
 report on the first hot-add, which then turns lockdep off for the rest of the
 boot.
 
+The tests added on 2026-11-09, and `sriov-disable-deadlock` after its setup
+and timing fixes, from a fresh clone that day (`./run test --all-runs --runs 3
+TEST`):
+
+| test | v7.4-rc1 |
+|---|---|
+| `vfio-exit-surprise` | hang in 3/3 (also fail, lockdep) |
+| `vfio-reset-surprise` | hang in 3/3 (also fail, lockdep) |
+| `sriov-disable-deadlock` | hang in 3/3 (also fail, lockdep) |
+| `bus-reset-removal-uaf` | lockdep in 3/3 (also fail) |
+| `nested-surprise-removal` | hang in 3/3 (also fail) |
+| `reset-prepare-order` | hang in 3/3 (also fail) |
+| `isolated-fn-aspm-oops` | oops in 3/3 (also fail) |
+| `isolated-fn-resume-removal` | fail in 3/3 (also lockdep) |
+| `hotadd-fn0-vanish` | oops in 3/3 (also fail, lockdep) |
+
+`reset-holds-probing` hung in 6 of 6 runs that day; on a heavily loaded host
+some of its runs don't deadlock and show N4's unbalanced unlock instead (3 of
+6 in development). The whole bug suite, `./run test --jobs 4 all` from the
+same clone, passed 47 of its 48 entries: `sysfs-remove-uaf` missed its race in
+its single run, then showed its KASAN report in 8 of 8 reruns, and now gets a
+second run.
+
 ## Fix tracking
 
 Fix tracking runs every test of the bug suite on each tree of
@@ -205,10 +254,10 @@ run to be clean.
 ```
 
 `./run fixes --tree PATH[@REV]` tests a commit of a local Linux tree without
-modifying it. Each fix tree is built as `<tree>-hooks`, `<tree>-hooks-kasan`
-and `<tree>-hooks-hc`: every test runs with the TEST ONLY patch, so a tree
-needs a variant of it that applies. The build uses the tree's patch from
-`configs/fix-trees.conf`, or for a local tree the first
+modifying it. Each fix tree is built as `<tree>-hooks`, `<tree>-hooks-kasan`,
+`<tree>-hooks-hc` and `<tree>-hooks-jh`: every test runs with the TEST ONLY
+patch, so a tree needs a variant of it that applies. The build uses the tree's
+patch from `configs/fix-trees.conf`, or for a local tree the first
 `patches/test-hooks*.patch` that applies (or `--patch FILE`).
 
 The regression tests:
@@ -229,16 +278,51 @@ Its author doesn't have enough expertise in pciehp, the PCI core reset code and
 vfio-pci to take it upstream alone, so it is meant as a reference for
 discussion and for whoever fixes these issues, not as a submission. Each
 commit message describes its bug, how the commit fixes it, and how it was
-tested. It fixes P0, N1, N2, N4-N9 and the original N10 deadlock, not N3, the
-N10 variants or N11-N24.
+tested. It fixes P0, N1, N2, N4-N9, the original N10 deadlock and its
+surprise-removal case, and the hot-add half of N27, not N3, the other N10
+variants, N11-N26 or the resume half of N27.
 
 `TEST_JOBS=8 ./run fixes` from the same fresh clone: 19 of 43 entries clean.
 The series is clean on the tests of P0, N1, N2 and N4-N9, on `nested-removal`
 (N10) and on `linkdown-hotadd-bars`. With it, `aer-hotadd-race` shows N12
 instead of hanging on N8, `spurious-link-lookup-deadlock` deadlocks through N11
 instead of N3, and `pciehp-rpm-safe-removal` and `pf-probe-sriov-removal` show
-N18's lockdep report and N21's warning, not regressions. Results per test and
-status per issue: [docs/fix-status.md](docs/fix-status.md).
+N18's lockdep report and N21's warning, not regressions. Of the eight tests
+added since (run on 2026-11-09), it is clean on `vfio-exit-surprise`,
+`vfio-reset-surprise`, `bus-reset-removal-uaf`, `nested-surprise-removal` and
+`hotadd-fn0-vanish`, so 24 of 51 entries. Results per test and status per
+issue: [docs/fix-status.md](docs/fix-status.md).
+
+## Series checks
+
+Tests written while testing posted series: what a series claims to fix,
+where that is not a bug of the catalog, and regressions that a series
+introduced. They are neither in the bug suite nor in fix tracking.
+`./run checks` runs them on v7.4-rc1 and expects the result in the table;
+`./run checks --tree PATH[@REV]` (or a tree of `configs/fix-trees.conf`)
+builds a tree like fix tracking and expects every run to pass. The results of
+the posted series: [docs/fix-status.md](docs/fix-status.md#posted-series).
+
+| test | tier | series | v7.4-rc1 | what it checks |
+|---|---|---|---|---|
+| `pf-reset-vf-wipe` | 1 | W10 | fail | a sysfs reset of an igb PF with 2 VFs must not wipe the VFs (VF0's Command register), and the PF must still be reset at `sriov_numvfs=0` |
+| `pf-reset-vf-wipe-vfio` | 1 | W10 | fail | the same through vfio-pci: open and close, VFIO_DEVICE_RESET and VFIO_DEVICE_PCI_HOT_RESET of the PF |
+| `vfio-recovery-restore` | 1 | W11, aer_unbound | fail | a vfio-pci NIC below a Root Port, held open with Bus Master set through vfio, gets a fatal error (`/dev/aer_inject`); it must keep BAR0 and memory decode after "device recovery successful" (E26) |
+| `vfio-recovery-restore-switch` | 1 | W11 | fail | the same below a switch, with the error at the switch's Upstream Port |
+| `aer-unbound` | 1 | aer_unbound | fail | a hot-added e1000e that was never bound gets two fatal errors, then e1000e is bound: both recoveries must succeed with BAR0 kept, and e1000e must bind |
+| `aer-unbound-mf` | 1 | aer_unbound | fail | function 0 of a two-function e1000e unbound, a fatal error at function 1: recovery must succeed and function 0 must rebind |
+| `aer-unbound-vfs` | 1 | aer_unbound | fail | an igb PF with 2 unbound VFs gets a fatal error: recovery must succeed, and the VFs must stay and bind afterwards |
+| `aer-no-handler` | 1 | aer_unbound | pass | a fatal error below a Root Port with an xhci controller, whose driver has no error handlers: recovery must not be reported successful while the BARs are lost (918b4053184c) |
+| `dpcwait-slow` | 2 | DPC timeout | fail | DPC recovery (emulated by a hook; QEMU's ports have no DPC) of a NIC that answers 4.5 s later: it must keep its driver, netdev and BAR0 |
+| `dpcwait-dead` | 2 | DPC timeout | pass | the same with a NIC that never answers and is surprise-removed 3 s into the recovery: pciehp must remove it within 5 s |
+| `vfio-pm-sriov-race` | 1 | vfio PM vs SR-IOV | warn | 10 rounds: a vfio-pci igb PF put in D3hot through vfio is closed while `sriov_numvfs=1` is written; no WARNING, no device left outside D0, no failed `sriov_numvfs` write |
+| `numa-pf-probe-hotadd` | 1 | W2 | pass | a hot-added igb PF that enables VFs in probe (`igb.max_vfs=2`) below a host bridge on a second NUMA node, so that pci_call_probe() probes it from pci_probe_wq: its VFs must appear |
+| `numa-pf-probe-rescan` | 1 | W2 | pass | the same through a sysfs rescan |
+
+"W" IDs are those of the catalog's section 4; aer_unbound is Lukas Wunner's
+branch from the W11 thread, "DPC timeout" Ziyou Wang's "PCI/DPC: Increase
+recovery timeout to 60 seconds" and "vfio PM vs SR-IOV" David Matlack's
+"vfio/pci: Fix power state race with SR-IOV enablement".
 
 ## How a test runs
 
@@ -253,8 +337,28 @@ prints its result and the kernel log on that port and powers off.
 `tools/vtool.c` (opens vfio-pci devices, holds them and resets them on
 request), `tools/wloop.c` (writes a sysfs file in a loop), `tools/cf1.c`
 (config access through configuration mechanism #1, past the kernel's config
-access lock) and `tools/aerinj.c` (injects AER errors through
-`/dev/aer_inject`).
+access lock), `tools/aerinj.c` (injects AER errors through
+`/dev/aer_inject`) and `tools/pmrace.c` (closes a vfio-pci PF in D3hot while
+another thread enables SR-IOV).
+
+Limits of the setup that tests work around:
+
+- QEMU has no surprise removal. Turning off a Root Port's Power Controller
+  and Power Indicator through configuration mechanism #1, behind the
+  kernel's back, makes QEMU detach the device, and restoring Slot Control
+  then delivers Presence Detect Changed (`deadreset.sh`, `deadlock.sh`'s
+  surprise variants). Doing that to the Root Port above a switch crashes
+  QEMU 11.1, so `nested-surprise-removal` removes the switch through
+  `pcitest/link_change` instead.
+- QEMU exposes a hot-added non-zero function only once function 0 is
+  there, so the N26 and N27 hot-add tests hide function 0 with a knob.
+- aer_inject takes its spinlock_t `inject_lock` under the raw spinlock
+  `pci_lock`, which lockdep reports as "BUG: Invalid wait context" on the
+  first config access after an injection and then turns itself off. The
+  harness lists that report as "ignored" in `result.json` and never counts
+  it; tests that inject errors can't show later lockdep reports.
+- Timing-dependent tests are noisy on a heavily loaded host; rerun them
+  before taking a single result for a change.
 
 A scenario's other variants run directly, e.g. the KASAN use-after-free of
 N21:
@@ -301,15 +405,15 @@ irq/25-pciehp, which holds pci_rescan_remove_lock, waits in vfio-pci's
 |---|---|
 | `linux/` | submodule: https://github.com/torvalds/linux at v7.4-rc1 |
 | `qemu/` | submodule: QEMU v11.1.0 |
-| `configs/` | kernel configs, `versions.env` (pinned commits, busybox version and checksum), `fix-trees.conf` (the trees fix tracking builds) |
+| `configs/` | kernel configs (`hc.config`, `jh.config` and `kasan.config` on top of `linux-x86_64.config`), `versions.env` (pinned commits, busybox version and checksum), `fix-trees.conf` (the trees fix tracking builds) |
 | `patches/` | the TEST ONLY hooks patch, for v7.4-rc1 and for the reference fix series |
 | `scripts/build.sh` | fetch, build kernels, QEMU, busybox, tools, initramfs |
-| `scripts/run-tests.sh` | the tests and both suites |
+| `scripts/run-tests.sh` | the tests, both suites and the series checks |
 | `harness/` | host side: `run.py` (QEMU and QMP), `qxparse.py` (log parser), `check.py` |
 | `guest/` | `/init`, helpers (`lib.sh`) and one script per scenario (`scn/`) |
 | `tools/` | static guest helpers |
 | `docs/catalog.md` | the issue catalog |
-| `docs/fix-status.md` | the reference fix series against the catalog and the fix tracking results |
+| `docs/fix-status.md` | the reference fix series against the catalog, the fix tracking results, and the results of posted series |
 
 The Linux and QEMU submodules are shallow. The build checks that they are at
 the pinned commits, then creates the hooks kernels' sources as generated
