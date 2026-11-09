@@ -19,10 +19,16 @@ trigger otherwise.  Every hook and knob is inert until written to:
 - hold_rescan_ms holds pci_rescan_remove_lock; remove_locked removes a
   device with the lock held across the whole removal.
 - rpm_allow lets a port without a PM capability runtime suspend.
+- dpc_reset (only with CONFIG_PCIE_DPC) emulates DPC recovery of a hotplug
+  Root Port; QEMU's ports have no DPC capability.
 - pciehp test_pre_scan_ms/test_post_scan_ms, pcitest/add_delay_ms and
   pcitest/probe_delay_ms widen the windows before and after pciehp scans a
   hot-added slot, between pci_device_add() putting a device on bus->devices
-  and device_add(), and inside a driver's probe.
+  and device_add(), and inside a driver's probe.  pciehp
+  test_pre_remove_ms/test_pre_remove_port delay one port's removal between
+  the IRQ thread's decision to remove and pci_rescan_remove_lock.
+- pciehp test_hide_fn0 makes function 0 of a slot vanish between the link
+  check and the scan.
 
 Applies to the pciehp-reset-fixes branch of https://github.com/opsound/linux
 (f1ceb362d0e9), whose pciehp_pci.c differs from v7.4-rc1 near the
@@ -32,12 +38,13 @@ kernels whose names contain "hooks".
 ---
  drivers/pci/Makefile                    |   5 +
  drivers/pci/hotplug/Makefile            |   3 +
+ drivers/pci/hotplug/pciehp_ctrl.c       |   3 +
  drivers/pci/hotplug/pciehp_pci.c        |   4 +
- drivers/pci/hotplug/pciehp_test_knobs.c |  66 ++++
+ drivers/pci/hotplug/pciehp_test_knobs.c | 129 ++++++
  drivers/pci/pci-driver.c                |   3 +
- drivers/pci/pcitest_hooks.c             | 505 ++++++++++++++++++++++++
+ drivers/pci/pcitest_hooks.c             | 581 ++++++++++++++++++++++++
  drivers/pci/probe.c                     |   3 +
- 7 files changed, 589 insertions(+)
+ 8 files changed, 731 insertions(+)
 
 diff --git a/drivers/pci/Makefile b/drivers/pci/Makefile
 index 41ebc3b9a518..bf2ed972912e 100644
@@ -63,6 +70,27 @@ index 40aaf31fe338..6e1ddf1909c8 100644
 +
 +# TEST ONLY (pciehp-reset-lab)
 +pciehp-objs += pciehp_test_knobs.o
+diff --git a/drivers/pci/hotplug/pciehp_ctrl.c b/drivers/pci/hotplug/pciehp_ctrl.c
+index 89eb741b01cf..f4ff50230f30 100644
+--- a/drivers/pci/hotplug/pciehp_ctrl.c
++++ b/drivers/pci/hotplug/pciehp_ctrl.c
+@@ -24,6 +24,8 @@
+ #include "../pci.h"
+ #include "pciehp.h"
+ 
++void pciehp_test_remove_delay(struct controller *ctrl);	/* TEST ONLY (pciehp-reset-lab) */
++
+ /* The following routines constitute the bulk of the
+    hotplug controller logic
+  */
+@@ -121,6 +123,7 @@ static int board_added(struct controller *ctrl)
+  */
+ static void remove_board(struct controller *ctrl, bool safe_removal)
+ {
++	pciehp_test_remove_delay(ctrl);	/* TEST ONLY (pciehp-reset-lab) */
+ 	pciehp_unconfigure_device(ctrl, safe_removal);
+ 
+ 	if (POWER_CTRL(ctrl)) {
 diff --git a/drivers/pci/hotplug/pciehp_pci.c b/drivers/pci/hotplug/pciehp_pci.c
 index a6cded8cf94d..246d8de92917 100644
 --- a/drivers/pci/hotplug/pciehp_pci.c
@@ -94,16 +122,16 @@ index a6cded8cf94d..246d8de92917 100644
  	ctrl->dsn = dev ? pci_get_dsn(dev) : 0;
 diff --git a/drivers/pci/hotplug/pciehp_test_knobs.c b/drivers/pci/hotplug/pciehp_test_knobs.c
 new file mode 100644
-index 000000000000..085a3f1d1dd9
+index 000000000000..a0fabb10c9b6
 --- /dev/null
 +++ b/drivers/pci/hotplug/pciehp_test_knobs.c
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,129 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * TEST ONLY, not for upstream.  pciehp knobs for the reproducers of
-+ * https://github.com/opsound/pciehp-reset-lab, kept out of pciehp_pci.c so
-+ * that only two one-line calls depend on the tree's pciehp_pci.c.  Linked
-+ * into pciehp, so the parameters appear as
++ * https://github.com/opsound/pciehp-reset-lab, kept out of pciehp_pci.c and
++ * pciehp_ctrl.c so that only one-line calls depend on the tree's versions of
++ * them.  Linked into pciehp, so the parameters appear as
 + * /sys/module/pciehp/parameters/test_*:
 + *
 + * test_pre_scan_ms:  pciehp_configure_device() sleeps this long right before
@@ -114,14 +142,25 @@ index 000000000000..085a3f1d1dd9
 + * test_error_reset:  writing "BDF" calls pci_bus_error_reset() on the port
 + *	like AER recovery, without holding any lock (same as writing "BDF 0"
 + *	to /sys/kernel/debug/pcitest/host_reset_nolock).
++ * test_pre_remove_ms, test_pre_remove_port: remove_board() of the port whose
++ *	BDF test_pre_remove_port names sleeps test_pre_remove_ms right before
++ *	pciehp_unconfigure_device(), i.e. after the IRQ thread decided to
++ *	remove and before it takes pci_rescan_remove_lock.  Logs "test:
++ *	sleeping N ms before unconfigure".
++ * test_hide_fn0:     right before pci_scan_slot(), function 0 of the slot's
++ *	bus stops answering config requests (reads fail as if absent, writes
++ *	are dropped), as if it vanished after pciehp_check_link_status()
++ *	found it.  The bus keeps the hiding pci_ops until the next boot.  Logs
++ *	"test: function 0 hidden before scan".
 + *
-+ * Both delays log "test: sleeping N ms before|after scan", which scenarios
-+ * wait for.
++ * The scan delays log "test: sleeping N ms before|after scan", which
++ * scenarios wait for.
 + */
 +#include <linux/delay.h>
 +#include <linux/kernel.h>
 +#include <linux/moduleparam.h>
 +#include <linux/pci.h>
++#include <linux/string.h>
 +#include "../pci.h"
 +#include "pciehp.h"
 +
@@ -129,17 +168,69 @@ index 000000000000..085a3f1d1dd9
 +module_param(test_pre_scan_ms, uint, 0644);
 +module_param(test_post_scan_ms, uint, 0644);
 +
++static bool test_hide_fn0;
++module_param(test_hide_fn0, bool, 0644);
++
++static struct pci_ops *test_orig_ops;
++
++static int test_hidden_read(struct pci_bus *bus, unsigned int devfn, int where,
++			    int size, u32 *val)
++{
++	if (devfn == PCI_DEVFN(0, 0)) {
++		PCI_SET_ERROR_RESPONSE(val);
++		return PCIBIOS_DEVICE_NOT_FOUND;
++	}
++	return test_orig_ops->read(bus, devfn, where, size, val);
++}
++
++static int test_hidden_write(struct pci_bus *bus, unsigned int devfn, int where,
++			     int size, u32 val)
++{
++	if (devfn == PCI_DEVFN(0, 0))
++		return PCIBIOS_DEVICE_NOT_FOUND;
++	return test_orig_ops->write(bus, devfn, where, size, val);
++}
++
++static struct pci_ops test_hidden_ops = {
++	.read = test_hidden_read,
++	.write = test_hidden_write,
++};
++
 +void pciehp_test_delay(struct controller *ctrl, bool post);
 +void pciehp_test_delay(struct controller *ctrl, bool post)
 +{
++	struct pci_bus *bus = ctrl->pcie->port->subordinate;
 +	unsigned int ms = post ? READ_ONCE(test_post_scan_ms) :
 +				 READ_ONCE(test_pre_scan_ms);
 +
++	if (!post && READ_ONCE(test_hide_fn0) && bus->ops != &test_hidden_ops) {
++		test_orig_ops = bus->ops;
++		pci_bus_set_ops(bus, &test_hidden_ops);
++		ctrl_info(ctrl, "test: function 0 hidden before scan\n");
++	}
 +	if (!ms)
 +		return;
 +	ctrl_info(ctrl, "test: sleeping %u ms %s scan\n", ms,
 +		  post ? "after" : "before");
 +	msleep(ms);
++}
++
++static unsigned int test_pre_remove_ms;
++module_param(test_pre_remove_ms, uint, 0644);
++static char test_pre_remove_port[16];
++module_param_string(test_pre_remove_port, test_pre_remove_port,
++		    sizeof(test_pre_remove_port), 0644);
++
++void pciehp_test_remove_delay(struct controller *ctrl);
++void pciehp_test_remove_delay(struct controller *ctrl)
++{
++	unsigned int ms = READ_ONCE(test_pre_remove_ms);
++
++	if (!ms || !sysfs_streq(test_pre_remove_port, pci_name(ctrl->pcie->port)))
++		return;
++	ctrl_info(ctrl, "test: sleeping %u ms before unconfigure\n", ms);
++	msleep(ms);
++	ctrl_info(ctrl, "test: unconfigure delay done\n");
 +}
 +
 +static int test_error_reset_set(const char *val, const struct kernel_param *kp)
@@ -187,10 +278,10 @@ index 7efe808cdf0c..6e1e688f166d 100644
  	error = pcibios_alloc_irq(pci_dev);
 diff --git a/drivers/pci/pcitest_hooks.c b/drivers/pci/pcitest_hooks.c
 new file mode 100644
-index 000000000000..a5a2c27551b2
+index 000000000000..d746af629474
 --- /dev/null
 +++ b/drivers/pci/pcitest_hooks.c
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,581 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Test-only hooks for the pciehp/vfio/PCI-reset deadlock reproducers of
@@ -248,6 +339,16 @@ index 000000000000..a5a2c27551b2
 + *	tree has it, else the loop that pcie-qcom.c and pcie-dw-rockchip.c use
 + *	(pci_host_handle_link_down() per Root Port).  Logs
 + *	"pcitest: link_down BDF: done".
++ * /sys/kernel/debug/pcitest/dpc_reset: "BDF" (only with CONFIG_PCIE_DPC)
++ *	emulates DPC recovery of a hotplug Root Port; QEMU's ports have no DPC
++ *	capability.  Points dpc_cap at read-only zeros (DPC Trigger Status
++ *	reads clear, dpc_reset_link()'s write to clear it is dropped), sets the
++ *	host bridge's native_dpc, then runs pcie_do_recovery(dev, frozen,
++ *	dpc_reset_link) as dpc_handler() does.  Once dpc_reset_link() has set
++ *	PCI_DPC_RECOVERING, it queues the Data Link Layer State Changed event
++ *	that containment causes, so that pciehp waits in pci_dpc_recovered().
++ *	dpc_cap and native_dpc stay set.  Logs "pcitest: dpc_reset BDF:
++ *	status=N".
 + *
 + * Test-only delays in the call sites that the patch adds:
 + * /sys/kernel/debug/pcitest/add_delay_ms (u32): sleep in
@@ -655,6 +756,69 @@ index 000000000000..a5a2c27551b2
 +	pr_info("pcitest: probe delay %s done\n", pci_name(dev));
 +}
 +
++#ifdef CONFIG_PCIE_DPC
++/*
++ * dpc_cap + PCI_EXP_DPC_STATUS lands on the first dword of the port's AER
++ * Header Log: read-only in QEMU and 0 without errors, so DPC Trigger Status
++ * reads clear and dpc_reset_link()'s write to clear it is dropped.
++ */
++#define PCITEST_FAKE_DPC_CAP(dev) \
++	((dev)->aer_cap + PCI_ERR_HEADER_LOG - PCI_EXP_DPC_STATUS)
++
++static struct pci_dev *pcitest_dpc_dev;
++static struct controller *pcitest_dpc_ctrl;
++
++static void pcitest_dpc_link_change(struct work_struct *work)
++{
++	struct pci_dev *dev = pcitest_dpc_dev;
++	int i;
++
++	for (i = 0; i < 1000; i++) {
++		if (test_bit(PCI_DPC_RECOVERING, &dev->priv_flags))
++			break;
++		msleep(5);
++	}
++	pr_info("pcitest: dpc_reset %s: recovering=%d, queueing DLLSC\n",
++		pci_name(dev), test_bit(PCI_DPC_RECOVERING, &dev->priv_flags));
++	pciehp_request(pcitest_dpc_ctrl, PCI_EXP_SLTSTA_DLLSC);
++}
++static DECLARE_WORK(pcitest_dpc_work, pcitest_dpc_link_change);
++
++static ssize_t dpc_reset_write(struct file *f, const char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	pci_ers_result_t status;
++	struct hotplug_slot *hp;
++	struct pci_dev *dev;
++	int ret;
++
++	dev = pcitest_get_dev(ubuf, len, NULL, &ret);
++	if (!dev)
++		return ret;
++	hp = pcitest_hotplug_slot(dev);
++	if (pci_pcie_type(dev) != PCI_EXP_TYPE_ROOT_PORT || !hp ||
++	    hp->ops->reset_slot != pciehp_reset_slot ||
++	    (!dev->dpc_cap && !dev->aer_cap)) {
++		pci_dev_put(dev);
++		return -ENODEV;
++	}
++	if (!dev->dpc_cap)
++		dev->dpc_cap = PCITEST_FAKE_DPC_CAP(dev);
++	pci_find_host_bridge(dev->bus)->native_dpc = 1;
++	pcitest_dpc_dev = dev;
++	pcitest_dpc_ctrl = to_ctrl(hp);
++	queue_work(system_dfl_wq, &pcitest_dpc_work);
++	pr_info("pcitest: dpc_reset %s: pcie_do_recovery (dpc_cap %#x)\n",
++		pci_name(dev), dev->dpc_cap);
++	status = pcie_do_recovery(dev, pci_channel_io_frozen, dpc_reset_link);
++	flush_work(&pcitest_dpc_work);
++	pr_info("pcitest: dpc_reset %s: status=%u\n", pci_name(dev), status);
++	pci_dev_put(dev);
++	return status == PCI_ERS_RESULT_RECOVERED ? len : -EIO;
++}
++static const struct file_operations dpc_reset_fops = { .write = dpc_reset_write };
++#endif
++
 +static const struct file_operations hold_fops = { .write = hold_write };
 +static const struct file_operations remove_locked_fops = { .write = remove_locked_write };
 +static const struct file_operations rpm_allow_fops = { .write = rpm_allow_write };
@@ -693,6 +857,9 @@ index 000000000000..a5a2c27551b2
 +#endif
 +	debugfs_create_u32("add_delay_ms", 0600, d, &pcitest_add_delay_ms);
 +	debugfs_create_u32("probe_delay_ms", 0600, d, &pcitest_probe_delay_ms);
++#ifdef CONFIG_PCIE_DPC
++	debugfs_create_file("dpc_reset", 0200, d, NULL, &dpc_reset_fops);
++#endif
 +	return 0;
 +}
 +late_initcall(pcitest_hooks_init);
