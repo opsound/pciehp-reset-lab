@@ -206,8 +206,8 @@ Tests not in the lab are described, not named.
   `sriov-disable-deadlock` clean (3/3 -> 0/7); `vfio-exit-deadlock`, `vfio-reset-deadlock` and
   `sysfs-remove-deadlock` still hang (7/7), through a new two-party cycle: the close-time
   pci_reset_bus() waits for pci_rescan_remove_lock, held by the remover of the device being closed.
-  `removal-stall`, `bind-during-removal`, `reset-removal-uaf` and `reset-subordinate-uaf` hang instead
-  of failing or reporting KASAN.
+  `removal-stall` hangs (6/6) instead of failing, and `bind-during-removal`, `reset-removal-uaf` and
+  `reset-subordinate-uaf` hang instead of failing or reporting KASAN.
 - W2, Benjamin Block / Ionut Nechita, v15 1-4 + v16 5/5 "PCI/IOV: Fix SR-IOV locking races and AB-BA
   deadlocks" (cover.1790267348.git.bblock@linux.ibm.com; base v7.3-rc4): `sriov-remove-abba` 7/8 ->
   0/8, `pf-unbind-unlocked-vf-removal` 8/8 -> 0/8, `sysfs-remove-deadlock` 4/4 -> 0/4;
@@ -217,9 +217,9 @@ Tests not in the lab are described, not named.
   goes from a use-after-free to an AB-BA deadlock.
 - W3, Keith Busch, RESEND "PCI: pciehp: fix concurrent sub-tree removal deadlock"
   (20251016193049.881212-2-kbusch@meta.com): `nested-surprise-removal` 6/6 -> 0/6, on v7.4-rc1 and
-  v6.18-rc1; `nested-removal`, `nested-bringup-deadlock`, `port-unbind-deadlock` and
+  v6.18-rc1; `nested-removal` (6/12 -> 6/15), `nested-bringup-deadlock`, `port-unbind-deadlock` and
   `port-unbind-host-reset` still hang. Without CONFIG_PCI the build fails (the RESEND dropped v2's
-  stub), and lockdep no longer reports pciehp's wait for pci_rescan_remove_lock.
+  stub). The trylock records no lockdep dependency, so N1's splat no longer fires.
 - W4, Zhang Hongtao, "PCI: Prevent device lock leak during bus reset"
   (20260821021626.1874602-1-zhanghongtao35@huawei.com): `bus-reset-removal-uaf` leaks no lock (13/13
   -> 0/16) but hits KASAN in 5/16 runs, in pci_bus_lock_fill() and pci_bus_resettable(); its `sub`
@@ -227,12 +227,24 @@ Tests not in the lab are described, not named.
 - W5, Abhin Parekadan Jose, RFC v4 "PCI: pciehp: Report surprise removal during safe removal"
   (20260927182017.938565-1-abhinjoses@gmail.com; base fd179f8a05be): a safe removal stuck in a
   driver's ->remove() ends 1.1 s after the device's surprise removal (3/3; without 4/5 it stays stuck,
-  2/2); no change in the full suite. P0, N14 and N22 are unchanged, as vfio-pci does not use the hook.
+  2/2). The lab's tests are unchanged; vfio-pci does not use the new hook.
 - W6, Shameer Kolothum, RFC v2 "vfio/pci: Handle PCI error recovery and report state to userspace"
-  (20260929173305.204856-1-skolothumtho@nvidia.com): not tested yet.
+  (20260929173305.204856-1-skolothumtho@nvidia.com; base v7.3-rc5, does not apply to v7.4-rc1): with
+  the opt-in it adds, a vfio-pci NIC keeps BAR0 and memory decode through a fatal error, below a Root
+  Port and below a switch (vfiorec scenario, `--var ep+rec` and `sw+rec`: BAR-LOST 6/6 -> 0/6); while
+  the recovery runs, config space and BAR reads fail with EIO and mmap reads with SIGBUS; the status
+  and sequence are reported. The restored state is the one saved at open, so a Bus Master bit the user
+  set afterwards is cleared. Without the opt-in, `vfio-recovery-restore` and
+  `vfio-recovery-restore-switch` are unchanged (6/6 BAR-LOST). The series checks:
+  `vfio-recovery-pm-deadlock` 0/6 -> 6/6 hangs, within 2-10 recoveries, in the four-task cycle of the
+  cover letter (in all six the pci_bus_sem writer was the rescan); `vfio-recovery-pm-lockdep`,
+  `vfio-recovery-d3-lockdep` and `vfio-recovery-close-lockdep` 0/6 -> 6/6 lockdep reports, the last
+  one without the opt-in. Through `./run checks --tree` on the series and on v7.3-rc5: 0/3 -> 3/3 each
+  (hangs within 1-3 recoveries). No other change in the full suite (99 runs per kernel).
 - W9, Lukas Wunner, "PCI: Fix order of device disablement on reset"
-  (4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de): `reset-prepare-order`
-  11/11 -> 0/10; no change in the full suite.
+  (4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de): the scenario that
+  `reset-prepare-order` was ported from hangs 11/11 -> 0/10; `reset-prepare-order` itself hangs in 3/3
+  runs on v7.4-rc1 and was clean in its one run on the series. No change in the full suite.
 - W10, Alex Williamson, RFC "PCI/vfio-pci: Guard resets against active SR-IOV VFs"
   (20260812045325.2733631-1-alex.williamson@nvidia.com; v7.2-rc7 and v7.4-rc1): `pf-reset-vf-wipe`
   and `pf-reset-vf-wipe-vfio` 6/6 -> 0/6 on both bases; no change in the full suite. Its hot-reset
@@ -247,9 +259,10 @@ Tests not in the lab are described, not named.
   no change in the full suite.
 - aer_unbound, Lukas Wunner, branch https://github.com/l1k/linux/commits/aer_unbound/ (not posted;
   offered for testing in aoSCK2Sy0HeyX_la@wunner.de), 9ce840949ee9 and db16ca536fd0 on v7.4-rc1:
-  `aer-unbound`, `aer-unbound-mf` and `aer-unbound-vfs` 4/4 -> 0/4; `aer-no-handler` 0/4 -> 4/4 (with
-  1/2 alone 2/2): xhci_hcd, which has no error handlers, is reported recovered with its BARs zeroed.
-  The unbound function of `aer-unbound-mf` comes back with Bus Master set (Command 0x0107).
+  `aer-unbound`, `aer-unbound-mf` and `aer-unbound-vfs` 4/4 -> 0/4 (on v7.4-rc1 the recovery fails;
+  igbvf still binds to the VFs of `aer-unbound-vfs` afterwards); `aer-no-handler` 0/4 -> 4/4 (with 1/2
+  alone 2/2): xhci_hcd, which has no error handlers, is reported recovered with its BARs zeroed. The
+  unbound function of `aer-unbound-mf` comes back with Bus Master set (Command 0x0107).
   `recovery-hotadd-msix` keeps the NIC's BARs (6/6 -> 0/6 BAR-LOST) but still warns.
 - E17, Raju Rangoju, "PCI: pciehp: fix circular lock dependency b/w pci_rescan_remove_lock and
   reset_lock" (20250619154610.902892-1-Raju.Rangoju@amd.com): `vfio-exit-deadlock`,
@@ -257,23 +270,24 @@ Tests not in the lab are described, not named.
   plus 2 clean KASAN runs each; `hotadd-lockdep` and `nested-lockdep` unchanged (N1); no change in the
   rest of the full suite.
 - E18, Jinhui Guo, RESEND "vfio/pci: Skip hot reset on Link-Down"
-  (20251215123029.2746-1-guojinhui.liam@bytedance.com): `vfio-exit-surprise` and
-  `vfio-reset-surprise` unchanged (6/6); the check never runs (catalog E18). With the check moved
-  below the saved-state block (not posted), `vfio-exit-surprise` 0/6, `vfio-reset-surprise` 6/6.
+  (20251215123029.2746-1-guojinhui.liam@bytedance.com): `vfio-exit-surprise` and `vfio-reset-surprise`
+  still hang (3/3 -> 6/6); the check never runs (catalog E18). With the check moved below the
+  saved-state block (not posted), `vfio-exit-surprise` 0/6, `vfio-reset-surprise` 6/6.
 - E19, Ziming Du, "PCI: Fix AB-BA deadlock between aer_isr() and device_shutdown()"
   (20260109095603.1088620-1-duziming2@huawei.com): `shutdown-aer-deadlock` with the bus-reset path
-  (`--var bus`) 8/8 -> 0/16; with the slot-reset path (the test's default) unchanged, 8/8. Contended
-  resets now fail with -EAGAIN (in `reset-holds-probing`, which then no longer hangs), and the bus
-  runs show e1000e's "disabling already-disabled device" WARNING (16/16).
+  (`--var bus`) 8/8 -> 0/16 lock hangs; 15/16 powered off, 1 run's console stopped early. The
+  slot-reset path (the test's default) is unchanged, 8/8. Contended resets now fail with -EAGAIN (in
+  `reset-holds-probing`, which then no longer hangs), and the bus runs show e1000e's "disabling
+  already-disabled device" WARNING (16/16).
 - Ziyou Wang, v2 "PCI/DPC: Increase recovery timeout to 60 seconds"
   (tencent_BB887B4DB8D2131AF5026893E0FE567D6D05@qq.com): `dpcwait-slow` 3/3 -> 0/3; `dpcwait-dead`
   0/3 -> 3/3: pciehp removes a surprise-removed device after 57.6 s instead of 1.1 s.
   `dead-link-reset-wait` unchanged (no DPC in QEMU).
 - David Matlack, "vfio/pci: Fix power state race with SR-IOV enablement"
   (20261029203324.1637772-1-dmatlack@google.com; base 076d7e989cb6 and v7.4-rc1): `vfio-pm-sriov-race`
-  rounds with the close-time WARNING 240/260 -> 0/860; 4 of 860 rounds still warn or fail
-  sriov_numvfs with -EIO through the final pci_restore_state() of vfio_pci_core_disable(), as do
-  unpatched kernels.
+  rounds with the close-time WARNING 240/260 -> 0/860; 3 of 860 rounds still warn through the final
+  pci_restore_state() of vfio_pci_core_disable(), as do unpatched kernels; 1 fails sriov_numvfs with
+  -EIO.
 
 ## Fix-tracking-only regression tests
 
