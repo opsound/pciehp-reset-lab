@@ -38,6 +38,12 @@ initramfs, then runs the bug suite. Build products and serial logs go to
 `out/`. Each result line names its serial log under `out/logs/`. The first
 build is large (six kernels); later builds are incremental.
 
+A built lab can be copied (`cp -a`) to try changes side by side. The copy's
+first build relinks or recreates the worktrees under `out/src` that still
+point into the original clone, and configures and builds QEMU and busybox in
+its own `out/`, so the original is left alone. Its kernels rebuild, as their
+build directories record absolute source paths.
+
 The host needs a C compiler and static libc development files, GNU make,
 binutils, flex, bison, bc, OpenSSL and ELF development files, Python 3, Meson,
 Ninja, pkg-config, GLib and Pixman development files, curl, `cpio`, gzip, and

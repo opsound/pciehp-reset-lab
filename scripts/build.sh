@@ -131,6 +131,29 @@ apply_patch() # dir patch commit
 	echo "$3 $(sha256sum < "${patch}" | cut -d' ' -f1)" > "${dir}.stamp"
 }
 
+# adopt_worktree DIR REPO: in a copy of a lab (cp -a), DIR's .git still points
+# into the original clone, so git commands in DIR would change the original's
+# worktree metadata.  Relink DIR to REPO's metadata if that was copied too,
+# else remove DIR so that it is created again.  Not with git worktree repair,
+# which also rewrites the .git files of the original's other worktrees.
+adopt_worktree()
+{
+	local dir="$1" repo="$2" common id
+
+	common="$(git -C "${repo}" rev-parse --path-format=absolute --git-common-dir)"
+	[ "$(git -C "${dir}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" = "${common}" ] &&
+		return 0
+	id="$(sed -n 's#^gitdir: .*/worktrees/##p' "${dir}/.git")"
+	if [ -n "${id}" ] && [ -d "${common}/worktrees/${id}" ]; then
+		echo "==> ${dir##*/}: relinking the worktree copied from another clone"
+		echo "gitdir: ${common}/worktrees/${id}" > "${dir}/.git"
+		echo "${dir}/.git" > "${common}/worktrees/${id}/gitdir"
+	else
+		echo "==> ${dir##*/}: recreating the worktree copied from another clone"
+		rm -rf -- "${dir}" "${dir}.stamp"
+	fi
+}
+
 # patched_worktree NAME REPO COMMIT PATCH: out/src/NAME, a detached worktree of
 # REPO at COMMIT with PATCH applied.
 patched_worktree()
@@ -138,6 +161,7 @@ patched_worktree()
 	local name="$1" repo="$2" commit="$3" patch="$4" dir="${out}/src/$1"
 
 	[ -f "${patch}" ] || { echo "missing patch ${patch}" >&2; exit 1; }
+	[ -e "${dir}/.git" ] && adopt_worktree "${dir}" "${repo}"
 	if [ -e "${dir}/.git" ]; then
 		stamp_ok "${dir}" "${commit}" "${patch}" && return 0
 		echo "==> Resetting ${name} to ${commit:0:12}"
@@ -202,6 +226,8 @@ add_tree()
 		[ -n "${patch}" ] || { echo "no patches/test-hooks*.patch applies to ${path} ${commit:0:12}; use --patch" >&2; exit 1; }
 	fi
 	case "${patch}" in /*) ;; *) patch="$(cd "$(dirname "${patch}")" && pwd)/${patch##*/}" ;; esac
+	# A patch of this lab is recorded relative to it, so a copy uses its own
+	case "${patch}" in "${root}"/*) patch="${patch#"${root}"/}" ;; esac
 	mkdir -p "${out}/src"
 	touch "${local_trees_conf}"
 	grep -v "^${name} " "${local_trees_conf}" > "${local_trees_conf}.tmp" || true
@@ -268,9 +294,29 @@ build_one_kernel() # name
 	esac
 }
 
+# qemu_configured_here: out/qemu was configured for this lab's qemu/ and out/qemu
+# (not copied from another clone, whose sources and pyvenv it would use)
+qemu_configured_here()
+{
+	python3 - "${qemu_build}" "${qemu_src}" <<'EOF'
+import json, os, sys
+build, src = sys.argv[1:]
+try:
+    d = json.load(open(os.path.join(build, "meson-info", "meson-info.json")))["directories"]
+except (OSError, ValueError, KeyError):
+    sys.exit(1)
+same = lambda a, b: os.path.realpath(a) == os.path.realpath(b)
+sys.exit(0 if same(d["source"], src) and same(d["build"], build) else 1)
+EOF
+}
+
 build_qemu()
 {
 	echo "==> Building QEMU ($(git -C "${qemu_src}" rev-parse --short HEAD))"
+	if [ -f "${qemu_build}/build.ninja" ] && ! qemu_configured_here; then
+		echo "==> out/qemu was configured in another clone; configuring it again"
+		rm -rf -- "${qemu_build}"
+	fi
 	mkdir -p "${qemu_build}"
 	if [ ! -f "${qemu_build}/build.ninja" ]; then
 		(
@@ -300,9 +346,11 @@ build_busybox()
 		# kernel headers.
 		sed -i -e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
 			-e 's/^CONFIG_TC=y/# CONFIG_TC is not set/' "${build}/.config"
-		(yes "" || true) | make -C "${build}" oldconfig > /dev/null
+		(yes "" || true) | make -C "${busybox_src}" O="${build}" oldconfig > /dev/null
 	fi
-	make -C "${build}" -j"${jobs}" busybox
+	# From the source directory, not through out/busybox/Makefile, which
+	# names the source and output directories of the clone that created it.
+	make -C "${busybox_src}" O="${build}" -j"${jobs}" busybox
 }
 
 build_tools()
