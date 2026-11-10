@@ -266,10 +266,11 @@ run to be clean.
 
 `./run fixes --tree PATH[@REV]` tests a commit of a local Linux tree without
 modifying it. Each fix tree is built as `<tree>-hooks`, `<tree>-hooks-kasan`,
-`<tree>-hooks-hc` and `<tree>-hooks-jh`: every test runs with the TEST ONLY
-patch, so a tree needs a variant of it that applies. The build uses the tree's
-patch from `configs/fix-trees.conf`, or for a local tree the first
-`patches/test-hooks*.patch` that applies (or `--patch FILE`).
+`<tree>-hooks-hc` and `<tree>-hooks-jh` (only those the selected tests run
+on): every test runs with the TEST ONLY patch, so a tree needs a variant of it
+that applies. The build uses the tree's patch from `configs/fix-trees.conf`,
+or for a local tree the first `patches/test-hooks*.patch` that applies (or
+`--patch FILE`).
 
 The regression tests:
 
@@ -312,8 +313,8 @@ where that is not a bug of the catalog, and regressions that a series
 introduced. They are neither in the bug suite nor in fix tracking.
 `./run checks` runs them on v7.4-rc1 and expects the result in the table;
 `./run checks --tree PATH[@REV]` (or a tree of `configs/fix-trees.conf`)
-builds a tree like fix tracking and expects every run to pass, or to be clean
-for the checks that are clean on v7.4-rc1: these boot with their devices
+builds the tree's `-hooks` kernel and expects every run to pass, or to be
+clean for the checks that are clean on v7.4-rc1: these boot with their devices
 present, so lockdep stays on and any lockdep report is a regression. The
 results of the posted series:
 [docs/fix-status.md](docs/fix-status.md#posted-series).

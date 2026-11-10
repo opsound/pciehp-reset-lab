@@ -67,18 +67,25 @@ fixes|checks)
 	if [ "${action}" = fixes ] && [ ${#trees[@]} -eq 0 ]; then
 		mapfile -t trees < <("${root}/scripts/build.sh" list-trees)
 	fi
+	targs=()
+	for t in "${trees[@]}"; do targs+=(--tree "${t}"); done
 	case " ${opts[*]} " in
 	*" --dry-run "*) ;;
 	*)
 		if [ ${#trees[@]} -gt 0 ]; then
-			make -C "${root}" -j"${JOBS:-$(nproc)}" fixes-build FIX_TREES="${trees[*]}"
+			# Only the kernels that the selected entries run on
+			kernels=()
+			for k in $("${root}/scripts/run-tests.sh" --suite "${action}" "${targs[@]}" \
+					--dry-run "${opts[@]}" 2>/dev/null | cut -d' ' -f1 | sort -u); do
+				kernels+=("kernel-${k}")
+			done
+			make -C "${root}" -j"${JOBS:-$(nproc)}" FIX_TREES="${trees[*]}" \
+				"${kernels[@]}" qemu initramfs
 		else
 			make -C "${root}" -j"${JOBS:-$(nproc)}" build
 		fi
 		;;
 	esac
-	targs=()
-	for t in "${trees[@]}"; do targs+=(--tree "${t}"); done
 	"${root}/scripts/run-tests.sh" --suite "${action}" "${targs[@]}" --jobs "${TEST_JOBS:-4}" "${opts[@]}"
 	;;
 *)
