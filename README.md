@@ -48,7 +48,10 @@ build directories record absolute source paths.
 The host needs a C compiler and static libc development files, GNU make,
 binutils, flex, bison, bc, OpenSSL and ELF development files, Python 3, Meson,
 Ninja, pkg-config, GLib and Pixman development files, curl, `cpio`, gzip, and
-access to `/dev/kvm`.
+access to `/dev/kvm`. The first build also needs network access, for the
+submodules, the busybox tarball and QEMU's configure, which downloads its
+keycodemapdb subproject and, if the host's Python lacks them, setuptools and
+wheel from PyPI.
 
 Narrower commands:
 
@@ -91,7 +94,7 @@ pci-host-common link-down recovery, which q35 can't reach otherwise.
 `dpc_reset` emulates DPC recovery, as QEMU's Root Ports have no DPC.
 
 "jh" tests run on `mainline-hooks-jh` with Jailhouse's CPUID signature in the
-guest (`-cpu host,hv-vendor-id=Jailhouse`), so that
+guest (`-cpu host,hv-relaxed,hv-vendor-id=Jailhouse`), so that
 `hypervisor_isolated_pci_functions()` is true and slots without function 0
 get scanned, as on s390, LoongArch and Jailhouse. Without that signature the
 option is inert.
@@ -346,9 +349,9 @@ branch from the W11 thread, "DPC timeout" Ziyou Wang's "PCI/DPC: Increase
 recovery timeout to 60 seconds" and "vfio PM vs SR-IOV" David Matlack's
 "vfio/pci: Fix power state race with SR-IOV enablement".
 
-A tree may have another base if a hooks patch applies to it. W6 applies only
-to v7.3-rc5, where `patches/test-hooks.patch` applies, so its checks run on
-the series and on v7.3-rc5 itself:
+A tree may have another base if a hooks patch applies to it. W6 doesn't
+apply to v7.4-rc1; it was tested on v7.3-rc5, where `patches/test-hooks.patch`
+applies, so its checks run on the series and on v7.3-rc5 itself:
 
 ```sh
 ./run checks --tree ~/linux@w6 --name w6 vfio-recovery-pm-deadlock
