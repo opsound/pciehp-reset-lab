@@ -248,7 +248,8 @@ some of its runs don't deadlock and show N4's unbalanced unlock instead (3 of
 6 in development). The whole bug suite, `./run test --jobs 4 all` from the
 same clone, passed 47 of its 48 entries: `sysfs-remove-uaf` missed its race in
 its single run, then showed its KASAN report in 8 of 8 reruns, and now gets a
-second run.
+second run. A later pass, with `pciehp-unbind-hot-reset-uaf`, passed all 49
+entries, and `./run checks` all 17 checks.
 
 ## Fix tracking
 
