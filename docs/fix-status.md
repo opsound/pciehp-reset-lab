@@ -198,7 +198,10 @@ Results of posted fixes in the lab, one per series, as of 2026-11-09. Each was a
 unless another base is named, built with the hooks patch (lockdep, KASAN and -hc kernels), and run on
 its targeted tests and once on the full suite, against the same base without the series. Lore links
 are https://lore.kernel.org/r/<message-id>. "n/m" counts runs that showed the symptom, base -> series.
-Tests not in the lab are described, not named.
+Tests not in the lab are described, not named. Except for W6's `./run checks --tree` results, the
+counts were taken in a copy of the lab per series, with the tests as they were then; those added for
+these series were still in development there, some under other names. The tests as published were
+run on v7.4-rc1 and, apart from the series checks, on the reference series.
 
 - W1, Qiang Yu, RFC "PCI: pciehp: Fix AB-BA deadlocks between reset_lock, pci_rescan_remove_lock and
   pci_slot_mutex" (20260817-ab-ba-deadlock-v1-1-e619fd07d1fd@oss.qualcomm.com): `hotadd-lockdep`,
@@ -236,11 +239,12 @@ Tests not in the lab are described, not named.
   and sequence are reported. The restored state is the one saved at open, so a Bus Master bit the user
   set afterwards is cleared. Without the opt-in, `vfio-recovery-restore` and
   `vfio-recovery-restore-switch` are unchanged (6/6 BAR-LOST). The series checks:
-  `vfio-recovery-pm-deadlock` 0/6 -> 6/6 hangs, within 2-10 recoveries, in the four-task cycle of the
-  cover letter (in all six the pci_bus_sem writer was the rescan); `vfio-recovery-pm-lockdep`,
-  `vfio-recovery-d3-lockdep` and `vfio-recovery-close-lockdep` 0/6 -> 6/6 lockdep reports, the last
-  one without the opt-in. Through `./run checks --tree` on the series and on v7.3-rc5: 0/3 -> 3/3 each
-  (hangs within 1-3 recoveries). No other change in the full suite (99 runs per kernel).
+  `vfio-recovery-pm-deadlock` 0/6 -> 6/6 hangs, within 2-10 recoveries, in the cover letter's cycle
+  of three tasks: the D0 writer, the recovery walk and the pci_bus_sem writer (in all six the rescan);
+  `vfio-recovery-pm-lockdep`, `vfio-recovery-d3-lockdep` and `vfio-recovery-close-lockdep` 0/6 -> 6/6
+  lockdep reports, the last one without the opt-in. Through `./run checks --tree` on the series and
+  on v7.3-rc5: 0/3 -> 3/3 each (hangs within 1-3 recoveries). No other change in the full suite (99
+  runs per kernel).
 - W9, Lukas Wunner, "PCI: Fix order of device disablement on reset"
   (4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de): the scenario that
   `reset-prepare-order` was ported from hangs 11/11 -> 0/10; `reset-prepare-order` itself hangs in 3/3
@@ -258,12 +262,13 @@ Tests not in the lab are described, not named.
   `hotadd-fn0-vanish` 6/6 -> 0/6; `isolated-fn-resume-removal` and `isolated-fn-aspm-oops` unchanged;
   no change in the full suite.
 - aer_unbound, Lukas Wunner, branch https://github.com/l1k/linux/commits/aer_unbound/ (not posted;
-  offered for testing in aoSCK2Sy0HeyX_la@wunner.de), 9ce840949ee9 and db16ca536fd0 on v7.4-rc1:
-  `aer-unbound`, `aer-unbound-mf` and `aer-unbound-vfs` 4/4 -> 0/4 (on v7.4-rc1 the recovery fails;
-  igbvf still binds to the VFs of `aer-unbound-vfs` afterwards); `aer-no-handler` 0/4 -> 4/4 (with 1/2
-  alone 2/2): xhci_hcd, which has no error handlers, is reported recovered with its BARs zeroed. The
-  unbound function of `aer-unbound-mf` comes back with Bus Master set (Command 0x0107).
-  `recovery-hotadd-msix` keeps the NIC's BARs (6/6 -> 0/6 BAR-LOST) but still warns.
+  offered for testing in aoSCK2Sy0HeyX_la@wunner.de), 9ce840949ee9 and db16ca536fd0 (on v7.1-rc1),
+  cherry-picked onto v7.4-rc1: `aer-unbound`, `aer-unbound-mf` and `aer-unbound-vfs` 4/4 -> 0/4 (on
+  v7.4-rc1 the recovery fails; igbvf still binds to the VFs of `aer-unbound-vfs` afterwards);
+  `aer-no-handler` 0/4 -> 4/4 (with 1/2 alone 2/2): xhci_hcd, which has no error handlers, is reported
+  recovered with its BARs zeroed. The unbound function of `aer-unbound-mf` comes back with Bus Master
+  set (Command 0x0107). `recovery-hotadd-msix` keeps the NIC's BARs (6/6 -> 0/6 BAR-LOST) but still
+  warns.
 - E17, Raju Rangoju, "PCI: pciehp: fix circular lock dependency b/w pci_rescan_remove_lock and
   reset_lock" (20250619154610.902892-1-Raju.Rangoju@amd.com): `vfio-exit-deadlock`,
   `vfio-reset-deadlock` and `sysfs-remove-deadlock` 4/4 -> 0/7, `sriov-disable-deadlock` 4/4 -> 0/21,
@@ -294,7 +299,9 @@ Tests not in the lab are described, not named.
 Not part of the bug suite: they check fix attempts for regressions, not mainline bugs.
 - `pciehp-rpm-safe-removal`: safe removal (sysfs power=0) of a card, present at boot in a slot without
   a power controller, while its Root Port is runtime-suspended (pcie_port_pm=force); the slot must stay
-  off, so a fix for N18 must not re-enumerate the card on runtime resume.
+  off for 5 s, so a fix for N18 must not re-enumerate the card on the runtime resume that the removal
+  causes. v7.4-rc1 itself re-adds the card on the port's next runtime resume (pciehp_check_presence()),
+  e.g. at shutdown.
 - `linkdown-hotadd-bars`: a NIC hot-added while the real pci-host-common link-down recovery of its Root
   Port runs (CONFIG_OF and CONFIG_PCI_HOST_GENERIC); the NIC must end up bound with its BARs, so a fix
   for N2 or N20 must not let pciehp bind it between the recovery's error_detected walk and its reset

@@ -485,8 +485,8 @@ remove_store(), a false positive; "remove" is DEVICE_ATTR_IGNORE_LOCKDEP in v7.4
 ## 3. Issues (N1-N27)
 
 N1-N10 and N15-N24 were found while testing; N11-N14 were found by review or are known from earlier
-reports; N25-N27 were found while testing posted series (W9, W12). All of them are present in
-v7.4-rc1. Earlier versions of this catalog called N11-N14 R1-R5
+reports; N25-N27 were reported by, or found while testing, posted series (W9, W12). All of them are
+present in v7.4-rc1. Earlier versions of this catalog called N11-N14 R1-R5
 (R1 = N11, R2 = N12, R3 and R5 = N13, R4 = N14).
 
 ### N1. pciehp_configure_device() re-acquires reset_lock with pci_rescan_remove_lock held
@@ -1242,7 +1242,7 @@ to the precursor RFC, posted in mst's thread on 2026-08-23
 **W6. Shameer Kolothum, "[RFC PATCH v2 00/16] vfio/pci: Handle PCI error recovery and report state to
 userspace"**, 2026-09-29 (v1 2026-09-01)
 https://lore.kernel.org/r/20260929173305.204856-1-skolothumtho@nvidia.com
-Opt-in host AER/DPC recovery for vfio-pci. The cover letter lists an unsolved four-task deadlock in
+Opt-in host AER/DPC recovery for vfio-pci. The cover letter lists an unsolved three-task deadlock in
 the RFC's own recovery path, found by AI review, with a queued pci_bus_sem writer (the N11/N3
 pattern). Alex replied that an SRCU-based disconnect of the device from its user-facing objects, his
 original idea for that deadlock, does not seem to resolve it but may be worthwhile for surprise unplug
@@ -1340,4 +1340,4 @@ Maintainer positions from earlier threads:
 | N24 | device_shutdown() vs AER recovery | E19 | none | shutdown-aer-deadlock |
 | N25 | slot/bus resets disable a bridge before the drivers below prepare | none (W9's changelog reports it) | W9 | reset-prepare-order |
 | N26 | isolated functions: no function 0, NULL link->downstream in pcie_aspm_init_link_state() | none | none | isolated-fn-aspm-oops |
-| N27 | pciehp's DSN and identity checks assume function 0 (resume teardown, NULL DSN read) | none (W12's changelog reports the hot-add half) | W12 (hot-add half) | isolated-fn-resume-removal, hotadd-fn0-vanish |
+| N27 | pciehp's DSN and identity checks assume function 0 (resume teardown, NULL DSN read) | none (W12's changelog reports the hot-add half, the Sashiko review of W12 the resume half) | W12 (hot-add half) | isolated-fn-resume-removal, hotadd-fn0-vanish |
