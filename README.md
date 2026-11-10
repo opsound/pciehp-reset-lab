@@ -264,6 +264,7 @@ run to be clean.
 ./run fixes                         # fix tracking on configs/fix-trees.conf
 ./run fixes --dry-run all           # list the fix tracking matrix
 ./run fixes --tree ~/linux@my-fix --name my-fix   # fix tracking on a local tree
+./run fixes --tree ~/linux@my-fix --name my-fix --runs 6 nested-removal   # one test, 6 runs
 ```
 
 `./run fixes --tree PATH[@REV]` tests a commit of a local Linux tree without

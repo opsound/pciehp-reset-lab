@@ -198,10 +198,12 @@ Results of posted fixes in the lab, one per series, as of 2026-11-09. Each was a
 unless another base is named, built with the hooks patch (lockdep, KASAN and -hc kernels), and run on
 its targeted tests and once on the full suite, against the same base without the series. Lore links
 are https://lore.kernel.org/r/<message-id>. "n/m" counts runs that showed the symptom, base -> series.
-Tests not in the lab are described, not named. Except for W6's `./run checks --tree` results, the
-counts were taken in a copy of the lab per series, with the tests as they were then; those added for
-these series were still in development there, some under other names. The tests as published were
-run on v7.4-rc1 and, apart from the series checks, on the reference series.
+Tests not in the lab are described, not named. Except for W6's `./run checks --tree` results and
+the W4 and W9 counts, the counts were taken in a copy of the lab per series, with the tests as they
+were then; those added for these series were still in development there, some under other names.
+The published tests, rerun through `--tree` on W3, W4, W9, W12, E18, aer_unbound and Ziyou Wang's
+series, gave the same results; they were also run on v7.4-rc1 and, apart from the series checks, on
+the reference series.
 
 - W1, Qiang Yu, RFC "PCI: pciehp: Fix AB-BA deadlocks between reset_lock, pci_rescan_remove_lock and
   pci_slot_mutex" (20260817-ab-ba-deadlock-v1-1-e619fd07d1fd@oss.qualcomm.com): `hotadd-lockdep`,
@@ -224,9 +226,11 @@ run on v7.4-rc1 and, apart from the series checks, on the reference series.
   `port-unbind-host-reset` still hang. Without CONFIG_PCI the build fails (the RESEND dropped v2's
   stub). The trylock records no lockdep dependency, so N1's splat no longer fires.
 - W4, Zhang Hongtao, "PCI: Prevent device lock leak during bus reset"
-  (20260821021626.1874602-1-zhanghongtao35@huawei.com): `bus-reset-removal-uaf` leaks no lock (13/13
-  -> 0/16) but hits KASAN in 5/16 runs, in pci_bus_lock_fill() and pci_bus_resettable(); its `sub`
-  variant (try-reset path) still leaks (3/3), and `reset-removal-uaf` (slot path) is unchanged.
+  (20260821021626.1874602-1-zhanghongtao35@huawei.com): `bus-reset-removal-uaf` leaks no lock (16/16
+  -> 0/32) but hits KASAN in 9/32 runs, in pci_bus_lock_fill() and pci_bus_resettable() (a freed
+  struct pci_bus); clearing dev->subordinate under pci_bus_sem before pci_remove_bus() (TEST ONLY)
+  makes it clean 32/32. The try-reset path (`harness/run.py --var sub`) still leaks (3/3), and
+  `reset-removal-uaf` (slot path) is unchanged.
 - W5, Abhin Parekadan Jose, RFC v4 "PCI: pciehp: Report surprise removal during safe removal"
   (20260927182017.938565-1-abhinjoses@gmail.com; base fd179f8a05be): a safe removal stuck in a
   driver's ->remove() ends 1.1 s after the device's surprise removal (3/3; without 4/5 it stays stuck,
@@ -246,9 +250,8 @@ run on v7.4-rc1 and, apart from the series checks, on the reference series.
   on v7.3-rc5: 0/3 -> 3/3 each (hangs within 1-3 recoveries). No other change in the full suite (99
   runs per kernel).
 - W9, Lukas Wunner, "PCI: Fix order of device disablement on reset"
-  (4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de): the scenario that
-  `reset-prepare-order` was ported from hangs 11/11 -> 0/10; `reset-prepare-order` itself hangs in 3/3
-  runs on v7.4-rc1 and was clean in its one run on the series. No change in the full suite.
+  (4c908eaab127d82ecfdc1e9948964b2e641d41d8.1789478646.git.lukas@wunner.de): `reset-prepare-order` 8/8 ->
+  0/10 hangs (also 8/8 on v7.4-rc1 with the hooks patch). No change in the full suite.
 - W10, Alex Williamson, RFC "PCI/vfio-pci: Guard resets against active SR-IOV VFs"
   (20260812045325.2733631-1-alex.williamson@nvidia.com; v7.2-rc7 and v7.4-rc1): `pf-reset-vf-wipe`
   and `pf-reset-vf-wipe-vfio` 6/6 -> 0/6 on both bases; no change in the full suite. Its hot-reset
@@ -277,7 +280,8 @@ run on v7.4-rc1 and, apart from the series checks, on the reference series.
 - E18, Jinhui Guo, RESEND "vfio/pci: Skip hot reset on Link-Down"
   (20251215123029.2746-1-guojinhui.liam@bytedance.com): `vfio-exit-surprise` and `vfio-reset-surprise`
   still hang (3/3 -> 6/6); the check never runs (catalog E18). With the check moved below the
-  saved-state block (not posted), `vfio-exit-surprise` 0/6, `vfio-reset-surprise` 6/6.
+  saved-state block (not posted), `vfio-exit-surprise` no longer hangs (0/6; N1's hot-add lockdep
+  report remains), `vfio-reset-surprise` still hangs (6/6).
 - E19, Ziming Du, "PCI: Fix AB-BA deadlock between aer_isr() and device_shutdown()"
   (20260109095603.1088620-1-duziming2@huawei.com): `shutdown-aer-deadlock` with the bus-reset path
   (`--var bus`) 8/8 -> 0/16 lock hangs; 15/16 powered off, 1 run's console stopped early. The
