@@ -22,8 +22,9 @@ The lab has two suites, plus checks for posted series:
 - **Series checks** test what posted series claim to fix outside the catalog,
   and regressions that posted series introduced. `./run checks` runs them on
   v7.4-rc1, expecting each check's v7.4-rc1 result; on a tree under test they
-  have to pass. See [Series checks](#series-checks); the results of posted
-  series are in [docs/fix-status.md](docs/fix-status.md#posted-series).
+  have to pass, and those that are clean on v7.4-rc1 have to stay clean. See
+  [Series checks](#series-checks); the results of posted series are in
+  [docs/fix-status.md](docs/fix-status.md#posted-series).
 
 ## One-command run
 
@@ -159,8 +160,9 @@ check failed, e.g. a hot-added device without its driver or with BAR0
 cleared, or an operation that took too long), `clean` (none of these), `pass`
 (series checks only: the scenario's check passed with no hang, oops or KASAN
 report; lockdep reports and warnings are allowed, as v7.4-rc1 shows N1's on
-the first hot-add). A run
-whose guest never booted counts as a harness error, never as a symptom. In
+the first hot-add). Series checks that are clean on v7.4-rc1 have no hot-add,
+so lockdep stays on, and expect `clean` on a tree too. A run whose guest never
+booted counts as a harness error, never as a symptom. In
 the bug suite an entry passes once a run shows its symptom; `--all-runs` makes
 it do every run, to measure the rate.
 
@@ -309,8 +311,11 @@ where that is not a bug of the catalog, and regressions that a series
 introduced. They are neither in the bug suite nor in fix tracking.
 `./run checks` runs them on v7.4-rc1 and expects the result in the table;
 `./run checks --tree PATH[@REV]` (or a tree of `configs/fix-trees.conf`)
-builds a tree like fix tracking and expects every run to pass. The results of
-the posted series: [docs/fix-status.md](docs/fix-status.md#posted-series).
+builds a tree like fix tracking and expects every run to pass, or to be clean
+for the checks that are clean on v7.4-rc1: these boot with their devices
+present, so lockdep stays on and any lockdep report is a regression. The
+results of the posted series:
+[docs/fix-status.md](docs/fix-status.md#posted-series).
 
 | test | tier | series | v7.4-rc1 | what it checks |
 |---|---|---|---|---|
@@ -327,11 +332,29 @@ the posted series: [docs/fix-status.md](docs/fix-status.md#posted-series).
 | `vfio-pm-sriov-race` | 1 | vfio PM vs SR-IOV | warn | 10 rounds: a vfio-pci igb PF put in D3hot through vfio is closed while `sriov_numvfs=1` is written; no WARNING, no device left outside D0, no failed `sriov_numvfs` write |
 | `numa-pf-probe-hotadd` | 1 | W2 | pass | a hot-added igb PF that enables VFs in probe (`igb.max_vfs=2`) below a host bridge on a second NUMA node, so that pci_call_probe() probes it from pci_probe_wq: its VFs must appear |
 | `numa-pf-probe-rescan` | 1 | W2 | pass | the same through a sysfs rescan |
+| `vfio-recovery-pm-deadlock` | 1 | W6 | clean | 60 s: a vfio-pci NIC opted in to W6's error recovery, whose user writes D3hot and D0 to PMCSR in a loop, gets fatal errors (`/dev/aer_inject`), each started together with a sysfs remove or rescan of an unbound NIC on another Root Port (a pci_bus_sem writer): no hang (the deadlock of W6's cover letter) |
+| `vfio-recovery-pm-lockdep` | 2 | W6 | clean | the same NIC, one D3hot/D0 write by its user, then one recovery of its Root Port (`pcitest/aer_reset`): no lockdep report (the deadlock's lock order) |
+| `vfio-recovery-d3-lockdep` | 2 | W6 | clean | the NIC left in D3hot by its user, then one recovery: no lockdep report (W6's `->slot_reset()` brings it to D0 inside the walk, taking pci_bus_sem again) |
+| `vfio-recovery-close-lockdep` | 2 | W6 | clean | `vfio-recovery-pm-lockdep` without opting in, then the close: no lockdep report (W6's `->error_detected()` takes access_lock of every vfio-pci device; close takes memory_lock under it) |
 
 "W" IDs are those of the catalog's section 4; aer_unbound is Lukas Wunner's
 branch from the W11 thread, "DPC timeout" Ziyou Wang's "PCI/DPC: Increase
 recovery timeout to 60 seconds" and "vfio PM vs SR-IOV" David Matlack's
 "vfio/pci: Fix power state race with SR-IOV enablement".
+
+A tree may have another base if a hooks patch applies to it. W6 applies only
+to v7.3-rc5, where `patches/test-hooks.patch` applies, so its checks run on
+the series and on v7.3-rc5 itself:
+
+```sh
+./run checks --tree ~/linux@w6 --name w6 vfio-recovery-pm-deadlock
+./run checks --tree ~/linux@v7.3-rc5 --name v7.3-rc5 vfio-recovery-pm-deadlock
+```
+
+What W6 claims to fix runs directly through `vfiorec`'s flags
+(`guest/scn/vfiorec.sh`): `+rec` opts in to its error recovery reporting,
+`+hook` reads the device during the recovery, `+nf` injects a non-fatal error,
+`+msix` and `+intx` re-arm an interrupt after the reset.
 
 ## How a test runs
 
@@ -344,9 +367,10 @@ second serial port; the host executes them over QMP. At the end the guest
 prints its result and the kernel log on that port and powers off.
 `harness/check.py` classifies the run. The static guest helpers are
 `tools/vtool.c` (opens vfio-pci devices, holds them and resets them on
-request), `tools/wloop.c` (writes a sysfs file in a loop), `tools/cf1.c`
-(config access through configuration mechanism #1, past the kernel's config
-access lock), `tools/aerinj.c` (injects AER errors through
+request; also reads them through vfio, writes their power state and opts in to
+W6's error recovery reporting), `tools/wloop.c` (writes a sysfs file in a
+loop), `tools/cf1.c` (config access through configuration mechanism #1, past
+the kernel's config access lock), `tools/aerinj.c` (injects AER errors through
 `/dev/aer_inject`) and `tools/pmrace.c` (closes a vfio-pci PF in D3hot while
 another thread enables SR-IOV).
 

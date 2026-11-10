@@ -9,8 +9,9 @@
 //	the first device only; SIGHUP prints a "VTPROBE" line per device
 //	(COMMAND read through vfio's config region, BAR0 + 8 through its BAR0
 //	region).  VT_CMD_OR=HEX sets those COMMAND bits through vfio after the
-//	open, as a user driver would.  Devices in one IOMMU group (functions of
-//	one multifunction device) share the group fd.
+//	open, as a user driver would; VT_REC, VT_IRQ, VT_MMAP, VT_D3,
+//	VT_D3CYCLE, VT_PMLOOP and VT_REARM (below) add more.  Devices in one
+//	IOMMU group (functions of one multifunction device) share the group fd.
 //   vtool loop N BDF	   open and close the device fd N times (close resets)
 //   vtool resetloop N BDF  open once, VFIO_DEVICE_RESET N times
 //   vtool hotresetloop N BDF  open once, VFIO_DEVICE_PCI_HOT_RESET N times
@@ -25,6 +26,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <stdint.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -32,6 +36,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
 #include <linux/vfio.h>
@@ -47,8 +52,263 @@ static void on_usr2(int sig) { (void)sig; do_close1 = 1; }
 static volatile sig_atomic_t do_probe;
 static void on_hup(int sig) { (void)sig; do_probe = 1; }
 
+/*
+ * PCI error recovery reporting of Shameer Kolothum's "[RFC PATCH v2 00/16]
+ * vfio/pci: Handle PCI error recovery and report state to userspace"
+ * (uapi copied from 15/16; kernels without it return ENOTTY).
+ *   VT_REC=1      enable it on each held device with an eventfd; a thread
+ *                 prints "VTREVT BDF n=N flags=0x.. seq=N" per notification
+ *   VT_IRQ=msix|intx  arm one interrupt of that type with an eventfd
+ *   VT_MMAP=1     mmap BAR0; SIGHUP probes also read BAR0 + 8 through it
+ *   VT_D3=1       put each device into D3hot through vfio's PMCSR
+ *   VT_D3CYCLE=1  first write D3hot and then D0 to it (before VT_D3)
+ *   VT_PMLOOP=FILE  a thread writes D3hot and D0 to the first device's PMCSR
+ *                 back to back, as a guest's runtime PM would, and keeps
+ *                 "n=N eio=N other=N" in FILE
+ *   VT_REARM=1    in a SIGHUP probe, re-arm VT_IRQ after a reported reset
+ */
+static double now(void);
+#ifndef VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY
+#define VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY 14
+#endif
+struct vt_rec {
+	uint32_t flags;
+	int32_t eventfd;
+	uint64_t sequence __attribute__((aligned(8)));
+};
+static int recfd[MAXDEV] = { [0 ... MAXDEV - 1] = -1 };
+static int irqfd[MAXDEV] = { [0 ... MAXDEV - 1] = -1 };
+static volatile unsigned char *bar0map[MAXDEV];
+static int pmcsr_off[MAXDEV];
+static sigjmp_buf bus_jmp;
+static volatile sig_atomic_t in_mmap_read;
+static void on_bus(int sig) { (void)sig; if (in_mmap_read) siglongjmp(bus_jmp, 1); _exit(99); }
+
+static const char *ename(int e)
+{
+	return strerrorname_np(e) ? strerrorname_np(e) : "?";
+}
+
+/* GET the recovery state: 0 and *st filled, or -errno */
+static int rec_get(int i, struct vt_rec *st)
+{
+	char buf[sizeof(struct vfio_device_feature) + sizeof(struct vt_rec)];
+	struct vfio_device_feature *f = (void *)buf;
+
+	memset(buf, 0, sizeof(buf));
+	f->argsz = sizeof(buf);
+	f->flags = VFIO_DEVICE_FEATURE_GET | VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY;
+	if (ioctl(devfd[i], VFIO_DEVICE_FEATURE, f))
+		return -errno;
+	memcpy(st, f->data, sizeof(*st));
+	return 0;
+}
+
+static int rec_set(int i, int fd)
+{
+	char buf[sizeof(struct vfio_device_feature) + sizeof(struct vt_rec)];
+	struct vfio_device_feature *f = (void *)buf;
+	struct vt_rec r = { .eventfd = fd };
+
+	memset(buf, 0, sizeof(buf));
+	f->argsz = sizeof(buf);
+	f->flags = VFIO_DEVICE_FEATURE_SET | VFIO_DEVICE_FEATURE_PCI_ERROR_RECOVERY;
+	memcpy(f->data, &r, sizeof(r));
+	return ioctl(devfd[i], VFIO_DEVICE_FEATURE, f) ? -errno : 0;
+}
+
+static void rec_str(int i, char *out, size_t len)
+{
+	struct vt_rec st;
+	int r = rec_get(i, &st);
+
+	if (r)
+		snprintf(out, len, "rec=%s", ename(-r));
+	else
+		snprintf(out, len, "rec=0x%x seq=%llu", st.flags, (unsigned long long)st.sequence);
+}
+
+static void *rec_thread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		struct pollfd pfd[MAXDEV];
+		int i;
+
+		for (i = 0; i < ndev; i++) {
+			pfd[i].fd = recfd[i];
+			pfd[i].events = POLLIN;
+		}
+		if (poll(pfd, ndev, -1) < 0)
+			continue;
+		for (i = 0; i < ndev; i++) {
+			unsigned long long v;
+			char st[64];
+
+			if (!(pfd[i].revents & POLLIN) || read(recfd[i], &v, sizeof(v)) != sizeof(v))
+				continue;
+			rec_str(i, st, sizeof(st));
+			printf("VTREVT %s n=%llu %s\n", bdf[i], v, st);
+			fflush(stdout);
+		}
+	}
+	return NULL;
+}
+
+static int arm_irq(int i, const char *type)
+{
+	char buf[sizeof(struct vfio_irq_set) + sizeof(int)];
+	struct vfio_irq_set *s = (void *)buf;
+
+	if (irqfd[i] < 0)
+		irqfd[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	s->argsz = sizeof(buf);
+	s->flags = VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER;
+	s->index = !strcmp(type, "intx") ? VFIO_PCI_INTX_IRQ_INDEX : VFIO_PCI_MSIX_IRQ_INDEX;
+	s->start = 0;
+	s->count = 1;
+	memcpy(s->data, &irqfd[i], sizeof(int));
+	return ioctl(devfd[i], VFIO_DEVICE_SET_IRQS, s) ? -errno : 0;
+}
+
+static off_t cfg_off(int i)
+{
+	struct vfio_region_info r = { .argsz = sizeof(r), .index = VFIO_PCI_CONFIG_REGION_INDEX };
+
+	return ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &r) ? -1 : (off_t)r.offset;
+}
+
+/* PMCSR offset in config space, through vfio's virtualized capability list */
+static int find_pmcsr(int i)
+{
+	off_t base = cfg_off(i);
+	unsigned char p = 0, id = 0;
+	int n = 0;
+
+	if (base < 0 || pread(devfd[i], &p, 1, base + 0x34) != 1)
+		return 0;
+	while (p && n++ < 48) {
+		if (pread(devfd[i], &id, 1, base + p) != 1)
+			return 0;
+		if (id == 1)
+			return p + 4;
+		if (pread(devfd[i], &p, 1, base + p + 1) != 1)
+			return 0;
+	}
+	return 0;
+}
+
+/* write power state STATE (0 or 3) to PMCSR: 0 or -errno */
+static int set_pm(int i, int state)
+{
+	off_t base = cfg_off(i);
+	unsigned short v = 0;
+
+	if (base < 0 || !pmcsr_off[i])
+		return -ENODEV;
+	if (pread(devfd[i], &v, 2, base + pmcsr_off[i]) != 2)
+		return -errno;
+	v = (v & ~3) | state;
+	if (pwrite(devfd[i], &v, 2, base + pmcsr_off[i]) != 2)
+		return -errno;
+	return 0;
+}
+
+static void *pm_thread(void *arg)
+{
+	const char *file = arg;
+	long n = 0, eio = 0, other = 0;
+	double tlast = 0;
+
+	for (;;) {
+		int r1 = set_pm(0, 3), r2 = set_pm(0, 0);
+
+		n++;
+		if (r1 == -EIO || r2 == -EIO)
+			usleep(200);	/* access blocked by recovery */
+		eio += (r1 == -EIO) + (r2 == -EIO);
+		other += (r1 && r1 != -EIO) + (r2 && r2 != -EIO);
+		if (now() - tlast > 0.2) {
+			FILE *f = fopen(file, "w");
+
+			if (f) {
+				fprintf(f, "n=%ld eio=%ld other=%ld\n", n, eio, other);
+				fclose(f);
+			}
+			tlast = now();
+		}
+	}
+	return NULL;
+}
+
+static void vt_setup(int i)
+{
+	if (getenv("VT_REC")) {
+		int r;
+
+		recfd[i] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		r = rec_set(i, recfd[i]);
+		printf("VTREC %s enable: %s\n", bdf[i], r ? ename(-r) : "ok");
+	}
+	if (getenv("VT_IRQ")) {
+		int r = arm_irq(i, getenv("VT_IRQ"));
+
+		printf("VTIRQ %s %s: %s\n", bdf[i], getenv("VT_IRQ"), r ? ename(-r) : "ok");
+	}
+	if (getenv("VT_MMAP")) {
+		struct vfio_region_info rb = { .argsz = sizeof(rb), .index = VFIO_PCI_BAR0_REGION_INDEX };
+		void *m = MAP_FAILED;
+
+		if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rb) && (rb.flags & VFIO_REGION_INFO_FLAG_MMAP))
+			m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, devfd[i], rb.offset);
+		bar0map[i] = m == MAP_FAILED ? NULL : m;
+		printf("VTMMAP %s: %s\n", bdf[i], bar0map[i] ? "ok" : strerror(errno));
+	}
+	pmcsr_off[i] = find_pmcsr(i);
+	if (getenv("VT_D3CYCLE")) {
+		int r1 = set_pm(i, 3), r2 = set_pm(i, 0);
+
+		printf("VTPM %s pmcsr=0x%x D3hot: %s D0: %s\n", bdf[i], pmcsr_off[i],
+		       r1 ? ename(-r1) : "ok", r2 ? ename(-r2) : "ok");
+	}
+	if (getenv("VT_D3")) {
+		int r = set_pm(i, 3);
+
+		printf("VTPM %s pmcsr=0x%x D3hot: %s\n", bdf[i], pmcsr_off[i], r ? ename(-r) : "ok");
+	}
+	fflush(stdout);
+}
+
+static void vt_start_threads(void)
+{
+	pthread_t t;
+
+	if (getenv("VT_REC"))
+		pthread_create(&t, NULL, rec_thread, NULL);
+	if (getenv("VT_PMLOOP") && pmcsr_off[0])
+		pthread_create(&t, NULL, pm_thread, getenv("VT_PMLOOP"));
+	signal(SIGBUS, on_bus);
+}
+
 /* SIGHUP in hold: read COMMAND through the config region and the 32-bit
- * register at BAR0 + 8 (e1000e STATUS) through the BAR0 region, as a user would. */
+ * register at BAR0 + 8 (e1000e STATUS) through the BAR0 region, as a user would;
+ * also through the mmap (VT_MMAP) and the recovery state (VT_REC). */
+static void mmap_read(int i, char *mm, size_t len)
+{
+	if (!sigsetjmp(bus_jmp, 1)) {
+		unsigned int mv;
+
+		in_mmap_read = 1;
+		mv = *(volatile unsigned int *)(bar0map[i] + 8);
+		in_mmap_read = 0;
+		snprintf(mm, len, " mmap_reg8=0x%x", mv);
+	} else {
+		in_mmap_read = 0;
+		snprintf(mm, len, " mmap_reg8=SIGBUS");
+	}
+}
+
+static unsigned int last_seq[MAXDEV];
 static void probe(int i)
 {
 	struct vfio_region_info rc = { .argsz = sizeof(rc), .index = VFIO_PCI_CONFIG_REGION_INDEX };
@@ -56,13 +316,35 @@ static void probe(int i)
 	unsigned short c = 0;
 	unsigned int v = 0;
 	ssize_t n1 = -1, n2 = -1;
+	int e1 = 0, e2 = 0;
+	char mm[48] = "", rs[64] = "", ra[48] = "";
 
-	if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rc))
+	if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rc)) {
 		n1 = pread(devfd[i], &c, 2, rc.offset + 4);
-	if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rb))
+		e1 = errno;
+	}
+	if (!ioctl(devfd[i], VFIO_DEVICE_GET_REGION_INFO, &rb)) {
 		n2 = pread(devfd[i], &v, 4, rb.offset + 8);
-	printf("VTPROBE %s vfio_cmd=%s0x%x bar0_reg8=%s0x%x\n", bdf[i], n1 == 2 ? "" : "ERR:", c,
-	       n2 == 4 ? "" : "ERR:", v);
+		e2 = errno;
+	}
+	if (bar0map[i])
+		mmap_read(i, mm, sizeof(mm));
+	if (getenv("VT_REC")) {
+		struct vt_rec st;
+
+		rs[0] = ' ';
+		rec_str(i, rs + 1, sizeof(rs) - 1);
+		if (getenv("VT_REARM") && getenv("VT_IRQ") && !rec_get(i, &st) &&
+		    (st.flags & 4) && st.sequence != last_seq[i]) {
+			int r = arm_irq(i, getenv("VT_IRQ"));
+
+			last_seq[i] = st.sequence;
+			snprintf(ra, sizeof(ra), " rearm_%s=%s", getenv("VT_IRQ"), r ? ename(-r) : "ok");
+		}
+	}
+	printf("VTPROBE %s vfio_cmd=%s%s0x%x bar0_reg8=%s%s0x%x%s%s%s\n", bdf[i],
+	       n1 == 2 ? "" : "ERR:", n1 == 2 ? "" : ename(e1), c,
+	       n2 == 4 ? "" : "ERR:", n2 == 4 ? "" : ename(e2), v, mm, rs, ra);
 	fflush(stdout);
 }
 
@@ -323,6 +605,9 @@ static int cmd_hold(int respond, int reset_on_req)
 			}
 		}
 	}
+	for (i = 0; i < ndev; i++)
+		vt_setup(i);
+	vt_start_threads();
 	signal(SIGUSR1, on_usr1);
 	signal(SIGUSR2, on_usr2);
 	signal(SIGHUP, on_hup);

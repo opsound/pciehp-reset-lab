@@ -35,7 +35,8 @@ import qxparse  # noqa: E402
 # ports, append: extra kernel args, cpu: -cpu, smp: -smp, lockdep_check: a
 # lockdep report fails the run, shutdown_check: seconds to wait for the
 # poweroff after the guest is done (its result depends on it: qxparse "CHECK:
-# poweroff"), by_var: per-variant overrides.
+# poweroff"), by_var: per-variant overrides (a variant "X+FLAG..." without an
+# entry of its own takes X's).
 PCP_OFF = "power_controller_present=off"
 # A Root Port without a hotplug slot, with an igb PF present at boot.
 RPC_IGB = ["-device", "pcie-root-port,id=rpc,bus=pcie.0,chassis=50,slot=50,addr=0x1d,hotplug=off",
@@ -93,8 +94,16 @@ SCN = {
                                    "-device", "virtio-blk-pci,id=vblk1,drive=nb1,bus=dp1"],
                        by_var={"bus": dict(rpsopts="hotplug=off"), "busio": dict(rpsopts="hotplug=off")}),
     # vfio-pci NIC after fatal-error recovery: ep below rp1, sw below the switch
+    # (sw2: with a second NIC on dp2)
     "vfiorec": dict(var="ep", timeout=150, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"],
-                    by_var={"sw": dict(nested=True, nestdevs="e1000e,-", qemu_extra=[])}),
+                    by_var={"sw": dict(nested=True, nestdevs="e1000e,-", qemu_extra=[]),
+                            "sw2": dict(nested=True, nestdevs="e1000e,e1000e", qemu_extra=[])}),
+    # W6 locking: vfio-pci NIC on rp1 at boot (no hot-add, so lockdep stays on),
+    # an unbound NIC on rp2 (dl: removed and rescanned in a loop, the pci_bus_sem
+    # writer), igb PF on rpc (dl+sriov: sriov_numvfs loop as the writer)
+    "w6pm": dict(var="lockdep-d3", timeout=200, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1",
+                                                            "-device", "e1000e,id=nicw,bus=rp2"] + RPC_IGB,
+                 by_var={"dl": dict(a="90", timeout=400)}),
     # AER recovery with unbound devices, and with a driver without error handlers
     "aerunb": dict(var="new", timeout=150, by_var={
         "mf": dict(qemu_extra=["-device", "e1000e,id=nic2,bus=rp2,addr=0.0,multifunction=on",
@@ -145,7 +154,8 @@ def defaults(scn, var):
              shutdown_check=0)
     d.update({k: v for k, v in SCN.get(scn, {}).items() if k != "by_var"})
     v = var if var is not None else d["var"]
-    d.update(SCN.get(scn, {}).get("by_var", {}).get(v, {}))
+    bv = SCN.get(scn, {}).get("by_var", {})
+    d.update(bv.get(v, bv.get(v.split("+")[0], {})))
     d["var"] = v
     return d
 

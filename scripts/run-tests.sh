@@ -15,6 +15,7 @@ usage: $0 [--suite bugs|fixes|checks] [--tree TREE]... [--jobs N] [--runs N] [--
                  the trees of configs/fix-trees.conf), expecting "clean"
   --suite checks the series checks: on v7.4-rc1, expecting each check's
                  v7.4-rc1 result; with --tree, on those trees, expecting "pass"
+                 ("clean" for the checks that are clean on v7.4-rc1)
   --runs N       runs per entry (default: the test's runs or fixruns)
   --all-runs     bug suite: do every run instead of stopping at the first one
                  that shows the symptom, to measure its rate
@@ -101,7 +102,8 @@ FIXTESTS=(
 # Fields as for TESTS; the expectation is the result on v7.4-rc1, "pass" for
 # the regression checks (harness/check.py: the scenario's check passes; lockdep
 # reports and warnings, such as N1's, don't count).  On a --tree every run has
-# to pass.
+# to pass; checks that are clean on v7.4-rc1 (no hot-add, so lockdep stays on)
+# have to stay clean, lockdep reports included.
 CHECKS=(
 	"pf-reset-vf-wipe - plain sriovguard sysfs - fail 1 2"
 	"pf-reset-vf-wipe-vfio - plain sriovguard vfio - fail 1 2"
@@ -116,6 +118,10 @@ CHECKS=(
 	"vfio-pm-sriov-race - plain pmsriov - 10 warn 1 3"
 	"numa-pf-probe-hotadd - plain numaprobe pciehp - pass 2 2"
 	"numa-pf-probe-rescan - plain numaprobe rescan - pass 2 2"
+	"vfio-recovery-pm-deadlock - plain w6pm dl+sync+inject 60 clean 2 3"
+	"vfio-recovery-pm-lockdep - hooks w6pm lockdep-pm - clean 2 2"
+	"vfio-recovery-d3-lockdep - hooks w6pm lockdep-d3 - clean 2 2"
+	"vfio-recovery-close-lockdep - hooks w6pm lockdep-pm+norec - clean 2 2"
 )
 TEST_NAMES="$(for t in "${TESTS[@]}" "${FIXTESTS[@]}" "${CHECKS[@]}"; do echo -n "${t%% *} "; done)"
 
@@ -179,8 +185,12 @@ add_entries() # suite tree defs...
 		read -r name issue flavor scn var rounds expect runs fixruns <<< "${t}"
 		kernel="$(kernel_for "${s}" "${tr}" "${flavor}")"
 		if [ "${s}" = fixes ]; then
-			expect=clean runs="${fixruns}"
-			[ "${suite}" = checks ] && expect=pass
+			if [ "${suite}" != checks ]; then
+				expect=clean
+			elif [ "${expect}" != clean ]; then
+				expect=pass
+			fi
+			runs="${fixruns}"
 		fi
 		if selected "${kernel}" "${name}" "${issue}"; then
 			entries+=("${kernel} ${name} ${scn} ${var} ${rounds} ${expect} ${runs_override:-${runs}}")
