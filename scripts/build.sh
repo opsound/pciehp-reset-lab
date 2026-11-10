@@ -9,7 +9,6 @@ qemu_src="${root}/qemu"
 out="${root}/out"
 qemu_build="${out}/qemu"
 tools_build="${out}/tools"
-rootfs="${out}/rootfs"
 jobs="${JOBS:-16}"
 cc="${CC:-cc}"
 fix_trees_conf="${root}/configs/fix-trees.conf"
@@ -366,7 +365,8 @@ build_tools()
 
 build_initramfs()
 {
-	local applet t
+	# Per-run names: guests of a concurrent run may be booting the image.
+	local applet t rootfs="${out}/rootfs.$$" img="${out}/initramfs.cpio.gz"
 
 	echo "==> Building initramfs"
 	rm -rf -- "${rootfs}"
@@ -384,7 +384,9 @@ build_initramfs()
 	(
 		cd "${rootfs}"
 		find . -print0 | LC_ALL=C sort -z | cpio --null -o --format=newc --quiet
-	) | gzip -n > "${out}/initramfs.cpio.gz"
+	) | gzip -n > "${img}.$$"
+	mv -f -- "${img}.$$" "${img}"
+	rm -rf -- "${rootfs}"
 }
 
 usage()
