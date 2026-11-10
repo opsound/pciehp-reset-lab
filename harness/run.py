@@ -98,7 +98,8 @@ SCN = {
     "vfiorec": dict(var="ep", timeout=150, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1"],
                     by_var={"sw": dict(nested=True, nestdevs="e1000e,-", qemu_extra=[]),
                             "sw2": dict(nested=True, nestdevs="e1000e,e1000e", qemu_extra=[])}),
-    # W6 locking: vfio-pci NIC on rp1 at boot (no hot-add, so lockdep stays on),
+    # W6 locking: vfio-pci NIC on rp1 at boot (no hot-add, so lockdep stays on
+    # unless +inject: aer_inject's own report turns it off),
     # an unbound NIC on rp2 (dl: removed and rescanned in a loop, the pci_bus_sem
     # writer), igb PF on rpc (dl+sriov: sriov_numvfs loop as the writer)
     "w6pm": dict(var="lockdep-d3", timeout=200, qemu_extra=["-device", "e1000e,id=nic1,bus=rp1",

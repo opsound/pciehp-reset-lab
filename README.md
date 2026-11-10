@@ -160,11 +160,10 @@ check failed, e.g. a hot-added device without its driver or with BAR0
 cleared, or an operation that took too long), `clean` (none of these), `pass`
 (series checks only: the scenario's check passed with no hang, oops or KASAN
 report; lockdep reports and warnings are allowed, as v7.4-rc1 shows N1's on
-the first hot-add). Series checks that are clean on v7.4-rc1 have no hot-add,
-so lockdep stays on, and expect `clean` on a tree too. A run whose guest never
-booted counts as a harness error, never as a symptom. In
-the bug suite an entry passes once a run shows its symptom; `--all-runs` makes
-it do every run, to measure the rate.
+the first hot-add). Series checks that are clean on v7.4-rc1 expect `clean`
+on a tree too. A run whose guest never booted counts as a harness error, never
+as a symptom. In the bug suite an entry passes once a run shows its symptom;
+`--all-runs` makes it do every run, to measure the rate.
 
 ## Results
 
@@ -314,9 +313,12 @@ introduced. They are neither in the bug suite nor in fix tracking.
 `./run checks` runs them on v7.4-rc1 and expects the result in the table;
 `./run checks --tree PATH[@REV]` (or a tree of `configs/fix-trees.conf`)
 builds the tree's `-hooks` kernel and expects every run to pass, or to be
-clean for the checks that are clean on v7.4-rc1: these boot with their devices
-present, so lockdep stays on and any lockdep report is a regression. The
-results of the posted series:
+clean for the checks that are clean on v7.4-rc1. The three `-lockdep` checks
+boot with their devices present and recover through `pcitest/aer_reset`, so
+lockdep stays on and any lockdep report is a regression.
+`vfio-recovery-pm-deadlock` injects errors through aer_inject, so lockdep
+reports that would come after aer_inject's own (see below) don't show; it
+checks for the hang. The results of the posted series:
 [docs/fix-status.md](docs/fix-status.md#posted-series).
 
 | test | tier | series | v7.4-rc1 | what it checks |

@@ -34,7 +34,8 @@ EOF
 #   scenario guest/scn/<scenario>.sh; var and rounds ("-": the default of
 #            harness/run.py) are passed to it as var= and a=
 #   expectation  the symptom the test shows on v7.4-rc1: hang, lockdep,
-#            kasan, warn or fail (harness/check.py)
+#            kasan, oops, warn or fail (harness/check.py); series checks also
+#            use pass and clean
 #   runs     bug suite: attempts until the symptom shows up
 #   fixruns  fix tracking: runs that all have to be clean
 TESTS=(
@@ -99,11 +100,12 @@ FIXTESTS=(
 # Series checks: tests written for posted series, of problems outside the
 # catalog (what a series claims to fix) or of regressions a series introduced.
 # Not bugs of the catalog, so neither in the bug suite nor in fix tracking.
-# Fields as for TESTS; the expectation is the result on v7.4-rc1, "pass" for
-# the regression checks (harness/check.py: the scenario's check passes; lockdep
-# reports and warnings, such as N1's, don't count).  On a --tree every run has
-# to pass; checks that are clean on v7.4-rc1 (no hot-add, so lockdep stays on)
-# have to stay clean, lockdep reports included.
+# Fields as for TESTS; the expectation is the result on v7.4-rc1, "pass" or
+# "clean" for the regression checks (harness/check.py; pass: the scenario's
+# check passes, lockdep reports and warnings, such as N1's, don't count).  On a
+# --tree every run has to pass; checks that are clean on v7.4-rc1 have to stay
+# clean, lockdep reports included (lockdep stays on in them until an aer_inject
+# injection, which only vfio-recovery-pm-deadlock does).
 CHECKS=(
 	"pf-reset-vf-wipe - plain sriovguard sysfs - fail 1 2"
 	"pf-reset-vf-wipe-vfio - plain sriovguard vfio - fail 1 2"
