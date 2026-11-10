@@ -298,4 +298,5 @@ def _outcome(r):
         elif NUM.match(tok):
             continue
         keep.append(tok)
-    return " ".join(keep)
+    # No separator left dangling by the dropped counts
+    return " ".join(keep).rstrip(",;")
